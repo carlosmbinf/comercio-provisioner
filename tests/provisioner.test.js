@@ -258,6 +258,7 @@ test("el helper exige COMERCIO_HOST igual al dominio solicitado", async () => {
 
   assert.match(helper, /COMERCIO_HOST HOST NODE_ENV PM2_APP_NAME PORT/);
   assert.match(helper, /COMERCIO_HOST=.*\$slug\.vidkar\.com/);
+  assert.doesNotMatch(helper, /wc -l < "\$decoded_file"/);
 });
 
 test("el .env de cada tienda usa el grupo vidkar-commerce creado por prepare-site", async () => {

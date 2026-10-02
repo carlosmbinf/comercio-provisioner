@@ -500,7 +500,6 @@ write_site_environment() {
   decoded_file="$(mktemp "$site_directory/.env.XXXXXX")"
   trap 'rm -f "$decoded_file"' EXIT HUP INT TERM
   printf '%s' "$environment_base64" | base64 --decode > "$decoded_file" || fail "Environment payload is not valid base64."
-  [ "$(wc -l < "$decoded_file" | tr -d ' ')" -eq 10 ] || fail "Environment payload has an unexpected number of entries."
 
   expected_keys="COMERCIO_HOST HOST NODE_ENV PM2_APP_NAME PORT VITE_COMERCIO_EMPRESA_ID VITE_COMERCIO_NOMBRE VITE_GOOGLE_MAPS_API_KEY VITE_METEOR_DDP_URL VITE_METEOR_HTTP_URL"
   actual_keys="$(sed 's/=.*//' "$decoded_file" | sort | tr '\n' ' ' | sed 's/ $//')"
