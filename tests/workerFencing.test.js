@@ -1,7 +1,15 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { confirmFinishOrDefer, createFencedClient } = require("../src/worker");
+const { confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment } = require("../src/worker");
+
+test("un retry manual de rollback nunca finaliza un journal de deployment activo", () => {
+  const activeJournal = { completedSteps: ["verify_site"], state: "ACTIVE" };
+
+  assert.equal(shouldFinishRecoveredDeployment({ rollbackOnly: true }, activeJournal), false);
+  assert.equal(shouldFinishRecoveredDeployment({ rollbackOnly: false }, activeJournal), true);
+  assert.equal(shouldFinishRecoveredDeployment({}, { completedSteps: [], state: "STARTING" }), false);
+});
 
 test("el cliente DDP añade el lease firmado a operaciones de la tarea actual", async () => {
   const calls = [];

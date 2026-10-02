@@ -3,6 +3,9 @@ const { rollbackDeployment } = require("./rollback");
 const { sanitizeMessage } = require("./workerUtils");
 const { sleep } = require("./taskLock");
 
+const shouldFinishRecoveredDeployment = (task, journal) => !task.rollbackOnly
+  && (journal.state === "ACTIVE" || journal.completedSteps?.includes("verify_site"));
+
 const confirmFinishOrDefer = async ({ finish, logger = console, onUnconfirmed = () => {}, wait = sleep }) => {
   const finishConfirmed = async () => {
     const result = await finish();
@@ -165,9 +168,7 @@ const startWorker = ({
         );
         return;
       }
-      const deploymentLooksComplete = journal.state === "ACTIVE"
-        || journal.completedSteps?.includes("verify_site");
-      if (deploymentLooksComplete) {
+      if (shouldFinishRecoveredDeployment(task, journal)) {
         try {
           const finishResult = await fencedClient.call(
             "comercio.provisioning.worker.finish",
@@ -388,4 +389,4 @@ const startWorker = ({
   };
 };
 
-module.exports = { confirmFinishOrDefer, createFencedClient, startWorker };
+module.exports = { confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment, startWorker };
