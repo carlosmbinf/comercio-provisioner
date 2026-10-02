@@ -210,6 +210,15 @@ test("el helper evita str.removeprefix para ser compatible con Python 3.8", asyn
   assert.equal(parsed.status, 0, parsed.stderr);
 });
 
+test("el .env de cada tienda usa el grupo vidkar-commerce creado por prepare-site", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+
+  assert.match(helper, /useradd .*--gid vidkar-commerce "\$run_user"/);
+  assert.match(helper, /chown "\$run_user:vidkar-commerce" "\$environment_file"/);
+  assert.doesNotMatch(helper, /chown "\$run_user:\$run_user" "\$environment_file"/);
+});
+
 test("el rollback reporta cada etapa terminada sin ejecutar operaciones privilegiadas inexistentes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-provisioner-rollback-"));
   const reports = [];

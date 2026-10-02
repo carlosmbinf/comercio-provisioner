@@ -75,12 +75,19 @@ test("runner registra diagnóstico sudo del helper con secretos redactados", asy
     "process.stderr.write('helper rejected SECRET=private-fixture Authorization: Bearer bearer-fixture'); process.exit(1)",
   ], options);
 
-  await assert.rejects(
-    () => runCommand("sudo", ["helper", "arguments-not-logged"], { logger, spawnImpl, timeoutMs: 5000 }),
-    /sudo terminó con código 1/,
-  );
+  let commandError;
+  try {
+    await runCommand("sudo", ["helper", "arguments-not-logged"], { logger, spawnImpl, timeoutMs: 5000 });
+  } catch (error) {
+    commandError = error;
+  }
 
   assert.match(lines[1], /CMD FAIL command=sudo exit=1 durationMs=\d+ detail=/);
   assert.match(lines[1], /SECRET=\[redactado\]/);
   assert.doesNotMatch(lines.join("\n"), /private-fixture|bearer-fixture|arguments-not-logged/);
+  assert.deepEqual(commandError.commandFailure, {
+    command: "sudo",
+    exitCode: 1,
+    stderr: "helper rejected SECRET=[redactado] Authorization: Bearer [redactado]",
+  });
 });

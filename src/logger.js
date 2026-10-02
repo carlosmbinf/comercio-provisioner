@@ -4,7 +4,9 @@ const cleanLogValue = (value, maxLength = 800) => String(value ?? "")
   .trim()
   .slice(0, maxLength);
 
-const sanitizeCommandDiagnostic = (value) => cleanLogValue(value, 600)
+const sanitizeSensitiveText = (value) => String(value ?? "")
+  .replace(/\r\n?/g, "\n")
+  .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, " ")
   .replace(/https?:\/\/[^\s]+/gi, (candidate) => {
     const punctuation = candidate.match(/[.,;:!?)]*$/)?.[0] || "";
     const rawUrl = candidate.slice(0, candidate.length - punctuation.length);
@@ -19,7 +21,14 @@ const sanitizeCommandDiagnostic = (value) => cleanLogValue(value, 600)
       return `[URL omitida]${punctuation}`;
     }
   })
-  .replace(/\b((?:authorization|token|secret|password|api[_-]?key)\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+/gi, "$1[redactado]");
+  .replace(/\b((?:[A-Z0-9_]*?(?:TOKEN|SECRET|PASSWORD|API[_-]?KEY)[A-Z0-9_]*|authorization)\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+/gi, "$1[redactado]");
+
+const sanitizeCommandDiagnostic = (value) => cleanLogValue(sanitizeSensitiveText(value), 600);
+const sanitizeCommandOutput = (value, maxLength = 1800) => {
+  const output = sanitizeSensitiveText(value).trim();
+  if (output.length <= maxLength) return output;
+  return `[salida truncada; últimos ${maxLength} caracteres]\n${output.slice(-maxLength)}`;
+};
 
 const createLogger = (context = {}, sink = console) => {
   const write = (level, message) => {
@@ -45,4 +54,4 @@ const createLogger = (context = {}, sink = console) => {
   };
 };
 
-module.exports = { cleanLogValue, createLogger, sanitizeCommandDiagnostic };
+module.exports = { cleanLogValue, createLogger, sanitizeCommandDiagnostic, sanitizeCommandOutput };

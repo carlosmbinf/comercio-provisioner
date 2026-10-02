@@ -525,7 +525,7 @@ write_site_environment() {
   [ "$(grep -Fxc 'HOST="127.0.0.1"' "$decoded_file")" -eq 1 ] || fail "Environment HOST is not allowed."
   [ "$(grep -Fxc 'NODE_ENV="production"' "$decoded_file")" -eq 1 ] || fail "Environment NODE_ENV is not allowed."
   mv "$decoded_file" "$environment_file"
-  chown "$run_user:$run_user" "$environment_file"
+  chown "$run_user:vidkar-commerce" "$environment_file"
   chmod 0600 "$environment_file"
   trap - EXIT HUP INT TERM
 }

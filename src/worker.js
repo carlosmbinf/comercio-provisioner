@@ -347,6 +347,7 @@ const startWorker = ({
           task.requestId,
           combinedMessage,
           rollbackResult.rollbackSucceeded,
+          error?.commandFailure || null,
         );
       } catch (_reportError) {
         taskLogger.warn("FLOW REPORT_FAILED el lease vigente permitirá recuperar la tarea");

@@ -1,6 +1,6 @@
 const { spawn } = require("node:child_process");
 const path = require("node:path");
-const { sanitizeCommandDiagnostic } = require("./logger");
+const { sanitizeCommandDiagnostic, sanitizeCommandOutput } = require("./logger");
 
 const SAFE_ENVIRONMENT_KEYS = new Set([
   "CI",
@@ -128,7 +128,15 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
     } else {
       const diagnostic = ["git", "sudo"].includes(safeCommand) ? sanitizeCommandDiagnostic(stderrTail) : "";
       logger.error?.(`CMD FAIL command=${safeCommand} exit=${code ?? "desconocido"} durationMs=${durationMs}${diagnostic ? ` detail="${diagnostic}"` : ""}`);
-      finish(new Error(`${safeCommand} terminó con código ${code ?? "desconocido"}.`));
+      const error = new Error(`${safeCommand} terminó con código ${code ?? "desconocido"}.`);
+      if (["git", "sudo"].includes(safeCommand) && Number.isInteger(code)) {
+        error.commandFailure = {
+          command: safeCommand,
+          exitCode: code,
+          stderr: sanitizeCommandOutput(stderrTail),
+        };
+      }
+      finish(error);
     }
   });
 
