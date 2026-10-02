@@ -227,7 +227,7 @@ const deployRequest = async ({
         await stateStore.write(requestId, journal);
       });
 
-    await runStep("install_dependencies", "Ejecutando npm install -f en la copia de comercio-web.", () =>
+    await runStep("install_dependencies", "Instalando dependencias de producción y compilación para incluir Vite.", () =>
       privilegedHelper.run("npm-install", [request.slug, requestId, runUser], { timeoutMs: config.npmTimeoutMs }));
 
     await runStep("generate_environment", "Generando el .env exclusivo de esta tienda.", async () => {

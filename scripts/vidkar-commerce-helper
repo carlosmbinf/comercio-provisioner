@@ -581,7 +581,7 @@ run_npm_install() {
   run_user=$3
   directory="$(service_directory "$slug" "$request_id" "$run_user")"
   npm_binary="$(trusted_binary npm)"
-  run_as_commerce "$run_user" "$directory" "$npm_binary" install -f
+  run_as_commerce "$run_user" "$directory" "$npm_binary" install -f --include=dev
 }
 
 run_npm_build() {

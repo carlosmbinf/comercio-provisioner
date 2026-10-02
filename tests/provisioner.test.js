@@ -210,6 +210,13 @@ test("el helper evita str.removeprefix para ser compatible con Python 3.8", asyn
   assert.equal(parsed.status, 0, parsed.stderr);
 });
 
+test("el helper instala dependencias de desarrollo necesarias para compilar Vite", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+
+  assert.match(helper, /run_as_commerce "\$run_user" "\$directory" "\$npm_binary" install -f --include=dev/);
+});
+
 test("el .env de cada tienda usa el grupo vidkar-commerce creado por prepare-site", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");
