@@ -1,5 +1,6 @@
 const { deployRequest } = require("./deployment");
 const { rollbackDeployment } = require("./rollback");
+const { createLogger } = require("./logger");
 const { sanitizeMessage } = require("./workerUtils");
 const { sleep } = require("./taskLock");
 
@@ -72,6 +73,7 @@ const startWorker = ({
   deploy = deployRequest,
   rollback = rollbackDeployment,
 }) => {
+  const rootLogger = createLogger({ workerId: config.workerId }, logger);
   let stopping = false;
   let activeRequestId = "";
   let activeLeaseToken = "";
@@ -104,11 +106,12 @@ const startWorker = ({
     activeLeaseLost = true;
     activeAbortController?.abort();
   };
-  const createTaskRunner = (lock) => ({
+  const createTaskRunner = (lock, taskLogger) => ({
     runCommand: (command, args, options = {}) => {
       assertLease();
       return runner.runCommand(command, args, {
         ...options,
+        logger: taskLogger,
         signal: activeAbortController?.signal,
         onSpawn: (processGroupId) => {
           lock.registerProcessGroup(processGroupId);
@@ -136,13 +139,20 @@ const startWorker = ({
   };
 
   const processRecovery = async (task) => {
+    const taskLogger = rootLogger.child({
+      flow: task.rollbackOnly ? "rollback-retry" : "recovery",
+      hostname: task.hostname,
+      requestId: task.requestId,
+      slug: task.slug,
+    });
+    taskLogger.info("FLOW START recuperación");
     setActiveTask(task);
     let lock;
     const fencedClient = createFencedClient({ assertLease, client, config, onLeaseLost: markLeaseLost, task });
     try {
       lock = await acquireTaskLock(task.requestId);
       assertLease();
-      const taskRunner = createTaskRunner(lock);
+      const taskRunner = createTaskRunner(lock, taskLogger);
       await fencedClient.call(
         "comercio.provisioning.worker.heartbeat",
         config.token,
@@ -151,6 +161,7 @@ const startWorker = ({
       );
       const journal = await stateStore.read(task.requestId);
       if (!journal) {
+        taskLogger.error("RECOVERY FAIL journal local ausente; requiere revisión manual");
         await fencedClient.call(
           "comercio.provisioning.worker.beginRollback",
           config.token,
@@ -197,7 +208,7 @@ const startWorker = ({
         assertLease,
         config,
         journal,
-        logger,
+        logger: taskLogger,
         onRollbackStep: (stepId, outcome, message) => fencedClient.call(
           "comercio.provisioning.worker.reportRollbackStep",
           config.token,
@@ -210,6 +221,7 @@ const startWorker = ({
         runner: taskRunner,
         stateStore,
       });
+      taskLogger.info(`FLOW ${result.rollbackSucceeded ? "OK" : "FAIL"} recuperación de rollback`);
       await fencedClient.call(
         "comercio.provisioning.worker.finishRecovery",
         config.token,
@@ -218,6 +230,9 @@ const startWorker = ({
         result.rollbackSucceeded,
         result.errors.join(" "),
       );
+    } catch (error) {
+      taskLogger.error(`RECOVERY FAIL reason=${sanitizeMessage(error?.message || "error inesperado")}`);
+      throw error;
     } finally {
       await lock?.release();
       clearActiveTask();
@@ -225,23 +240,33 @@ const startWorker = ({
   };
 
   const processDeployment = async (task) => {
+    const taskLogger = rootLogger.child({
+      flow: "deploy",
+      hostname: task.hostname,
+      requestId: task.requestId,
+      slug: task.slug,
+    });
+    taskLogger.info("FLOW START aprovisionamiento");
     setActiveTask(task);
     let lock;
     const fencedClient = createFencedClient({ assertLease, client, config, onLeaseLost: markLeaseLost, task });
     try {
       lock = await acquireTaskLock(task.requestId);
       assertLease();
-      const taskRunner = createTaskRunner(lock);
+      const taskRunner = createTaskRunner(lock, taskLogger);
       const result = await deploy({
         assertLease,
         client: fencedClient,
         config,
-        logger,
+        logger: taskLogger,
         runner: taskRunner,
         stateStore,
         request: task,
       });
-      if (result?.blockedDns) return;
+      if (result?.blockedDns) {
+        taskLogger.warn("FLOW BLOCKED DNS no apunta al VPS; se detuvo antes de clonar");
+        return;
+      }
       assertLease();
       const finishConfirmed = await confirmFinishOrDefer({
         finish: () => fencedClient.call(
@@ -250,24 +275,26 @@ const startWorker = ({
           config.workerId,
           task.requestId,
         ),
-        logger,
+        logger: taskLogger,
         onUnconfirmed: () => {
           activeLeaseLost = true;
           activeAbortController?.abort();
         },
       });
       if (!finishConfirmed) return;
+      taskLogger.info("FLOW OK aprovisionamiento confirmado por VIDKAR");
     } catch (error) {
       if (error?.code === "TASK_LOCK_BUSY") {
-        logger.warn("[comercio-provisioner] Otra ejecución local posee el lock; no se inició otro aprovisionamiento.");
+        taskLogger.warn("FLOW SKIP otra ejecución local posee el lock");
         return;
       }
       if (activeLeaseLost || error?.error === "provisioner-lease-lost" || error?.code === "WORKER_LEASE_LOST") {
         activeLeaseLost = true;
         activeAbortController?.abort();
-        logger.warn("[comercio-provisioner] Se perdió el lease; los comandos se cancelaron y el nuevo propietario se encargará de la recuperación.");
+        taskLogger.warn("FLOW ABORTED lease perdido; comandos cancelados y recuperación delegada al nuevo propietario");
         return;
       }
+      taskLogger.error(`FLOW FAIL reason=${sanitizeMessage(error?.message || "error inesperado")}; inicia rollback`);
       const journal = error?.provisionerJournal || await stateStore.read(task.requestId).catch(() => null);
       let rollbackResult = {
         errors: ["No se pudo leer el journal; no se puede confirmar el rollback."],
@@ -284,14 +311,14 @@ const startWorker = ({
             sanitizeMessage(error?.message || "Falló una tarea del aprovisionamiento."),
           );
         } catch (_beginRollbackError) {
-          logger.warn("[comercio-provisioner] No se pudo publicar el inicio del rollback; continuará la reversión local bajo lock.");
+          taskLogger.warn("ROLLBACK no se pudo publicar el inicio; se continuará bajo el lock local");
         }
         try {
           rollbackResult = await rollback({
             assertLease,
             config,
             journal,
-            logger,
+            logger: taskLogger,
             onRollbackStep: (stepId, outcome, message) => fencedClient.call(
               "comercio.provisioning.worker.reportRollbackStep",
               config.token,
@@ -301,13 +328,14 @@ const startWorker = ({
               outcome,
               message,
             ),
-            runner: createTaskRunner(lock),
+            runner: createTaskRunner(lock, taskLogger),
             stateStore,
           });
         } catch (_rollbackError) {
           rollbackResult = { errors: ["El proceso de rollback lanzó un error inesperado."], rollbackSucceeded: false };
         }
       }
+      taskLogger.info(`FLOW ${rollbackResult.rollbackSucceeded ? "ROLLED_BACK" : "ROLLBACK_FAILED"}`);
 
       const publicMessage = sanitizeMessage(error?.message || "Falló una tarea del aprovisionamiento.");
       const combinedMessage = [publicMessage, ...rollbackResult.errors].filter(Boolean).join(" ").slice(0, 500);
@@ -321,7 +349,7 @@ const startWorker = ({
           rollbackResult.rollbackSucceeded,
         );
       } catch (_reportError) {
-        logger.warn("[comercio-provisioner] No pudo informar el resultado; el lease vigente permitirá recuperar la tarea.");
+        taskLogger.warn("FLOW REPORT_FAILED el lease vigente permitirá recuperar la tarea");
       }
     } finally {
       await lock?.release();
@@ -339,7 +367,7 @@ const startWorker = ({
         activeLeaseLost = true;
         activeAbortController?.abort();
       }
-      logger.warn("[comercio-provisioner] No llegó el heartbeat; se intentará de nuevo.");
+      rootLogger.warn("HEARTBEAT FAIL; se intentará de nuevo");
     } finally {
       heartbeatBusy = false;
     }
@@ -356,7 +384,7 @@ const startWorker = ({
         config.workerId,
         config.publicIpv4,
       );
-      logger.info("[comercio-provisioner] Worker registrado. Esperando tareas con DNS verificado.");
+      rootLogger.info("WORKER registrado; esperando tareas con DNS verificado");
 
       heartbeatTimer = setInterval(sendHeartbeat, Math.min(config.heartbeatIntervalMs, 30000));
       heartbeatTimer.unref?.();
@@ -371,7 +399,7 @@ const startWorker = ({
           if (task.recoveryRequired) await processRecovery(task);
           else await processDeployment(task);
         } catch (error) {
-          logger.warn(`[comercio-provisioner] No se pudo procesar la cola: ${sanitizeMessage(error?.message || "error de conexión")}`);
+          rootLogger.warn(`QUEUE FAIL reason=${sanitizeMessage(error?.message || "error de conexión")}`);
           await sleep(config.pollIntervalMs);
         }
       }

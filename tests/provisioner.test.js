@@ -145,17 +145,22 @@ test("el worker se detiene antes de clonar si la resolución DNS no coincide", a
 });
 
 test("rechaza deploy si la copia Git conserva un .env versionado", async () => {
+  let gitArgs;
   await assert.rejects(
     () => assertNoTrackedEnvironmentFile({
       config: { commandTimeoutMs: 5000 },
-      runner: { runCommand: async () => ({ stdoutTail: ".env\n" }) },
+      runner: { runCommand: async (_command, args) => {
+        gitArgs = args;
+        return { stdoutTail: ".env\0apps/comercio/.env.production\0" };
+      } },
       siteDirectory: "/tmp/site",
     }),
     /\.env versionados/,
   );
+  assert.deepEqual(gitArgs, ["-C", "/tmp/site", "ls-tree", "-r", "-z", "--name-only", "HEAD"]);
   await assert.doesNotReject(() => assertNoTrackedEnvironmentFile({
     config: { commandTimeoutMs: 5000 },
-    runner: { runCommand: async () => ({ stdoutTail: ".env.example\n" }) },
+    runner: { runCommand: async () => ({ stdoutTail: ".env.example\0apps/comercio/.env.sample\0README.md\0" }) },
     siteDirectory: "/tmp/site",
   }));
 });

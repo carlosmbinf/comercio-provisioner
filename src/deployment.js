@@ -45,8 +45,7 @@ const findAvailablePort = async ({ config, stateStore, portProbe = isPortAvailab
 
 const assertNoTrackedEnvironmentFile = async ({ runner, siteDirectory, config }) => {
   const result = await runner.runCommand("git", [
-    "-C", siteDirectory, "ls-tree", "-r", "--name-only", "HEAD", "--",
-    ".env", ".env.*", ":(glob)**/.env", ":(glob)**/.env.*",
+    "-C", siteDirectory, "ls-tree", "-r", "-z", "--name-only", "HEAD",
   ], {
     captureTailLength: 65536,
     envOverrides: {
@@ -56,7 +55,8 @@ const assertNoTrackedEnvironmentFile = async ({ runner, siteDirectory, config })
     },
     timeoutMs: config.commandTimeoutMs,
   });
-  const tracked = result.stdoutTail.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean)
+  const tracked = result.stdoutTail.split("\0").map((entry) => entry.trim()).filter(Boolean)
+    .filter((filename) => /(?:^|\/)\.env(?:\..*)?$/.test(filename))
     .filter((filename) => ![".env.example", ".env.sample"].includes(path.posix.basename(filename)));
   if (tracked.length) {
     throw new Error("El repositorio comercio-web contiene archivos .env versionados. Sácalos del índice de Git y vuelve a desplegar.");
@@ -141,15 +141,23 @@ const deployRequest = async ({
     message,
   );
   const runStep = async (stepId, message, action) => {
-    assertLease();
-    await reportStep(stepId, "STARTED", message);
-    await stateStore.write(requestId, { ...journal, currentStep: stepId });
-    const result = await action();
-    assertLease();
-    journal.completedSteps.push(stepId);
-    await stateStore.write(requestId, { ...journal, currentStep: null });
-    await reportStep(stepId, "COMPLETED", message);
-    return result;
+    const startedAt = Date.now();
+    logger.info?.(`STAGE START step=${stepId} detail=${message}`);
+    try {
+      assertLease();
+      await reportStep(stepId, "STARTED", message);
+      await stateStore.write(requestId, { ...journal, currentStep: stepId });
+      const result = await action();
+      assertLease();
+      journal.completedSteps.push(stepId);
+      await stateStore.write(requestId, { ...journal, currentStep: null });
+      await reportStep(stepId, "COMPLETED", message);
+      logger.info?.(`STAGE OK step=${stepId} durationMs=${Date.now() - startedAt}`);
+      return result;
+    } catch (error) {
+      logger.error?.(`STAGE FAIL step=${stepId} durationMs=${Date.now() - startedAt} reason=${error?.message || "error inesperado"}`);
+      throw error;
+    }
   };
 
   const dnsAddresses = await runStep(
@@ -293,10 +301,11 @@ const deployRequest = async ({
     journal.state = "ACTIVE";
     journal.completedAt = new Date().toISOString();
     await stateStore.write(requestId, journal);
+    logger.info?.("FLOW OK deployment completed");
     return { blockedDns: false, publicUrl: `https://${request.hostname}` };
   } catch (error) {
     error.provisionerJournal = journal;
-    logger.error?.(`[comercio-provisioner] Falló ${request.hostname}: ${error.message}`);
+    logger.error?.(`FLOW FAIL reason=${error.message}`);
     throw error;
   }
 };

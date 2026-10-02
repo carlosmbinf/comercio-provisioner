@@ -12,6 +12,7 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
   const errors = [];
   const privilegedHelper = createPrivilegedHelperRunner({ config, runner });
   const runRollbackStep = async (stepId, label, operation) => {
+    const startedAt = Date.now();
     const report = async (outcome, message) => {
       try {
         await onRollbackStep(stepId, outcome, message);
@@ -21,17 +22,20 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
       }
     };
     assertLease();
+    logger.info?.(`ROLLBACK START step=${stepId} detail=${label}`);
     await report("STARTED", `${label}: iniciado.`);
     try {
       assertLease();
       await operation();
       assertLease();
       await report("COMPLETED", `${label}: completado.`);
+      logger.info?.(`ROLLBACK OK step=${stepId} durationMs=${Date.now() - startedAt}`);
     } catch (error) {
       if (error?.code === "WORKER_LEASE_LOST") throw error;
       assertLease();
       errors.push(`${label}: no se pudo completar.`);
       await report("FAILED", `${label}: requiere revisión.`);
+      logger.error?.(`ROLLBACK FAIL step=${stepId} durationMs=${Date.now() - startedAt} reason=${error?.message || "error inesperado"}`);
     }
   };
 

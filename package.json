@@ -8,7 +8,7 @@
     "start": "node src/index.js",
     "start:pm2": "pm2 start ecosystem.config.cjs",
     "test": "node --test tests/*.test.js",
-    "check": "node --check src/config.js && node --check src/meteorClient.js && node --check src/commandRunner.js && node --check src/stateStore.js && node --check src/taskLock.js && node --check src/workerIdentity.js && node --check src/dns.js && node --check src/nginxConfig.js && node --check src/privilegedHelper.js && node --check src/serviceUser.js && node --check src/deployment.js && node --check src/rollback.js && node --check src/workerUtils.js && node --check src/worker.js && node --check src/index.js && sh -n scripts/vidkar-commerce-helper"
+    "check": "node --check src/config.js && node --check src/meteorClient.js && node --check src/commandRunner.js && node --check src/logger.js && node --check src/stateStore.js && node --check src/taskLock.js && node --check src/workerIdentity.js && node --check src/dns.js && node --check src/nginxConfig.js && node --check src/privilegedHelper.js && node --check src/serviceUser.js && node --check src/deployment.js && node --check src/rollback.js && node --check src/workerUtils.js && node --check src/worker.js && node --check src/index.js && sh -n scripts/vidkar-commerce-helper"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

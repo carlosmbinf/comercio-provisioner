@@ -1,5 +1,6 @@
 const { spawn } = require("node:child_process");
 const path = require("node:path");
+const { sanitizeGitDiagnostic } = require("./logger");
 
 const SAFE_ENVIRONMENT_KEYS = new Set([
   "CI",
@@ -44,6 +45,7 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
     onClose,
   } = options;
   const safeCommand = path.basename(command);
+  const startedAt = Date.now();
   let stdoutTail = "";
   let stderrTail = "";
   let settled = false;
@@ -51,7 +53,7 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
   let killTimeout;
   let processGroupTerminationRequested = false;
 
-  logger.info?.(`[comercio-provisioner] Ejecutando ${safeCommand}.`);
+  logger.info?.(`CMD START command=${safeCommand}`);
   let child;
   try {
     child = spawnImpl(command, args, {
@@ -62,6 +64,7 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
       stdio: ["ignore", "pipe", "pipe"],
     });
   } catch (_error) {
+    logger.error?.(`CMD FAIL command=${safeCommand} reason=spawn_error`);
     reject(new Error(`No se pudo iniciar ${safeCommand}.`));
     return;
   }
@@ -108,14 +111,25 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
   };
   child.once("error", async () => {
     await notifyClose();
+    logger.error?.(`CMD FAIL command=${safeCommand} reason=spawn_error durationMs=${Date.now() - startedAt}`);
     finish(new Error(`No se pudo iniciar ${safeCommand}.`));
   });
   child.once("close", async (code, signal) => {
     if (processGroupTerminationRequested) terminateProcessGroup("SIGKILL");
     await notifyClose();
+    const durationMs = Date.now() - startedAt;
     const result = { code, signal: signal || null, stderrTail, stdoutTail };
-    if (code === 0 || allowFailure) finish(null, result);
-    else finish(new Error(`${safeCommand} terminó con código ${code ?? "desconocido"}.`));
+    if (code === 0) {
+      logger.info?.(`CMD OK command=${safeCommand} exit=0 durationMs=${durationMs}`);
+      finish(null, result);
+    } else if (allowFailure) {
+      logger.warn?.(`CMD WARN command=${safeCommand} exit=${code ?? "desconocido"} durationMs=${durationMs}`);
+      finish(null, result);
+    } else {
+      const diagnostic = safeCommand === "git" ? sanitizeGitDiagnostic(stderrTail) : "";
+      logger.error?.(`CMD FAIL command=${safeCommand} exit=${code ?? "desconocido"} durationMs=${durationMs}${diagnostic ? ` detail="${diagnostic}"` : ""}`);
+      finish(new Error(`${safeCommand} terminó con código ${code ?? "desconocido"}.`));
+    }
   });
 
   try {
