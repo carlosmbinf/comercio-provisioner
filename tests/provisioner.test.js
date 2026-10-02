@@ -16,7 +16,7 @@ const {
 } = require("../src/deployment");
 const { dnsPointsToVps, resolveA } = require("../src/dns");
 const { renderHttpNginxConfig, renderHttpsNginxConfig } = require("../src/nginxConfig");
-const { signOperation } = require("../src/privilegedHelper");
+const { createPrivilegedHelperRunner, signOperation } = require("../src/privilegedHelper");
 const { rollbackDeployment } = require("../src/rollback");
 const { createStateStore, isSafeRequestId } = require("../src/stateStore");
 
@@ -78,6 +78,24 @@ test("firma cada operación privilegiada vinculando acción y argumentos", () =>
   assert.match(signature, /^[a-f0-9]{64}$/);
   assert.notEqual(signature, signOperation(secret, "remove-site", ["otro", "request-123"]));
   assert.notEqual(signature, signOperation(secret, "install-http", ["mercado-norte", "request-123"]));
+});
+
+test("el helper privilegiado acepta acciones PM2 con dígitos y sigue rechazando argumentos inseguros", async () => {
+  const calls = [];
+  const helper = createPrivilegedHelperRunner({
+    config: {
+      helperHmacSecret: "helper-secret-" + "h".repeat(48),
+      privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+    },
+    runner: { runCommand: async (...args) => { calls.push(args); return { code: 0 }; } },
+  });
+
+  await helper.run("pm2-delete", ["tienda", "request-123", "vcommerce-123456789abc"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "sudo");
+  assert.ok(calls[0][1].includes("pm2-delete"));
+  assert.throws(() => helper.run("pm2 delete", ["tienda"]), /Operación privilegiada no válida/);
+  assert.throws(() => helper.run("remove-site", ["tienda\nroot"]), /Operación privilegiada no válida/);
 });
 
 test("genera un .env dotenv-compatible con valores escapados y sin credenciales de worker", () => {
@@ -309,6 +327,44 @@ test("el rollback reporta cada etapa terminada sin ejecutar operaciones privileg
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }
+});
+
+test("el rollback conserva Nginx y la cuenta si no puede confirmar que PM2 se detuvo", async () => {
+  const calls = [];
+  const reports = [];
+  const result = await rollbackDeployment({
+    config: {
+      acmeWebroot: "/var/www/letsencrypt",
+      commandTimeoutMs: 5000,
+      deployRoot: "/opt/vidkar/comercios",
+      helperHmacSecret: "helper-secret-" + "h".repeat(48),
+      nginxSitesAvailable: "/etc/nginx/sites-available",
+      nginxSitesEnabled: "/etc/nginx/sites-enabled",
+      privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+      stateDir: "/var/lib/vidkar-provisioner/state",
+    },
+    journal: {
+      hostname: "tienda.vidkar.com",
+      nginxChanged: true,
+      pm2StartAttempted: true,
+      requestId: "request-pm2-stop-failed",
+      runUser: "vcommerce-123456789abc",
+      siteDirectoryCreated: true,
+      slug: "tienda",
+      state: "ROLLING_BACK",
+    },
+    logger: { error() {}, info() {}, warn() {} },
+    onRollbackStep: async (...entry) => reports.push(entry),
+    runner: { runCommand: async (...args) => { calls.push(args); throw new Error("pm2 helper failed"); } },
+    stateStore: { write: async () => {} },
+  });
+
+  assert.equal(result.rollbackSucceeded, false);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1][4], "pm2-delete");
+  assert.deepEqual(reports.filter(([, outcome]) => outcome === "FAILED").map(([stepId]) => stepId), [
+    "stop_pm2", "remove_nginx", "remove_site",
+  ]);
 });
 
 test("una recuperación de journal ya revertido vuelve a publicar los pasos como completados", async () => {

@@ -30,12 +30,14 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
       assertLease();
       await report("COMPLETED", `${label}: completado.`);
       logger.info?.(`ROLLBACK OK step=${stepId} durationMs=${Date.now() - startedAt}`);
+      return true;
     } catch (error) {
       if (error?.code === "WORKER_LEASE_LOST") throw error;
       assertLease();
       errors.push(`${label}: no se pudo completar.`);
       await report("FAILED", `${label}: requiere revisión.`);
       logger.error?.(`ROLLBACK FAIL step=${stepId} durationMs=${Date.now() - startedAt} reason=${error?.message || "error inesperado"}`);
+      return false;
     }
   };
 
@@ -50,7 +52,8 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
     return { errors, rollbackSucceeded: true };
   }
 
-  await runRollbackStep("stop_pm2", "Detener PM2", async () => {
+  const pm2MayBeRunning = Boolean(journal.pm2StartAttempted || journal.pm2Started);
+  const pm2Stopped = await runRollbackStep("stop_pm2", "Detener PM2", async () => {
     if (journal.pm2StartAttempted || journal.pm2Started) {
       await privilegedHelper.run("pm2-delete", [journal.slug, journal.requestId, journal.runUser], {
         timeoutMs: config.commandTimeoutMs,
@@ -62,6 +65,9 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
   });
 
   await runRollbackStep("remove_nginx", "Retirar Nginx", async () => {
+    if (pm2MayBeRunning && !pm2Stopped) {
+      throw new Error("Se conserva Nginx y el sitio porque no se pudo confirmar que PM2 esté detenido.");
+    }
     if (journal.nginxChanged || journal.siteDirectoryCreated) {
       await privilegedHelper.run("remove-nginx", [
         journal.slug,
@@ -75,6 +81,9 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
   });
 
   await runRollbackStep("remove_site", "Eliminar la copia", async () => {
+    if (pm2MayBeRunning && !pm2Stopped) {
+      throw new Error("Se conserva la cuenta y el sitio porque no se pudo confirmar que PM2 esté detenido.");
+    }
     if (journal.siteDirectoryCreated) {
       await privilegedHelper.run("remove-site", [journal.slug, journal.requestId, journal.runUser], {
         timeoutMs: config.commandTimeoutMs,

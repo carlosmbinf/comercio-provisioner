@@ -9,7 +9,7 @@ const signOperation = (secret, operation, args) => crypto
 
 const createPrivilegedHelperRunner = ({ config, runner }) => ({
   run: (operation, args, options = {}) => {
-    if (!/^[a-z-]+$/.test(operation) || !Array.isArray(args) || args.some((value) => /[\0\r\n]/.test(String(value)))) {
+    if (!/^[a-z0-9-]+$/.test(operation) || !Array.isArray(args) || args.some((value) => /[\0\r\n]/.test(String(value)))) {
       throw new Error("Operación privilegiada no válida.");
     }
     const signature = signOperation(config.helperHmacSecret, operation, args);
