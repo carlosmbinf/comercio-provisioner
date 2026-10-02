@@ -195,6 +195,14 @@ test("el helper root rechaza operaciones y argumentos desconocidos antes de toca
   assert.match(unsupported.stderr, /Privileged helper key is not installed/);
 });
 
+test("el helper evita str.removeprefix para ser compatible con Python 3.8", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+
+  assert.doesNotMatch(helper, /\.removeprefix\(/);
+  assert.match(helper, /name = member\.name\[2:\] if member\.name\.startswith\("\.\/"\) else member\.name/);
+});
+
 test("el rollback reporta cada etapa terminada sin ejecutar operaciones privilegiadas inexistentes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-provisioner-rollback-"));
   const reports = [];
