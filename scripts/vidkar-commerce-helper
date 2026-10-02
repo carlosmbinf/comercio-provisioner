@@ -500,30 +500,22 @@ write_site_environment() {
   decoded_file="$(mktemp "$site_directory/.env.XXXXXX")"
   trap 'rm -f "$decoded_file"' EXIT HUP INT TERM
   printf '%s' "$environment_base64" | base64 --decode > "$decoded_file" || fail "Environment payload is not valid base64."
-  [ "$(wc -l < "$decoded_file" | tr -d ' ')" -eq 9 ] || fail "Environment payload has an unexpected number of entries."
+  [ "$(wc -l < "$decoded_file" | tr -d ' ')" -eq 10 ] || fail "Environment payload has an unexpected number of entries."
 
-  expected_keys="HOST NODE_ENV PM2_APP_NAME PORT VITE_COMERCIO_EMPRESA_ID VITE_COMERCIO_NOMBRE VITE_GOOGLE_MAPS_API_KEY VITE_METEOR_DDP_URL VITE_METEOR_HTTP_URL"
+  expected_keys="COMERCIO_HOST HOST NODE_ENV PM2_APP_NAME PORT VITE_COMERCIO_EMPRESA_ID VITE_COMERCIO_NOMBRE VITE_GOOGLE_MAPS_API_KEY VITE_METEOR_DDP_URL VITE_METEOR_HTTP_URL"
   actual_keys="$(sed 's/=.*//' "$decoded_file" | sort | tr '\n' ' ' | sed 's/ $//')"
   [ "$actual_keys" = "$(printf '%s\n' $expected_keys | sort | tr '\n' ' ' | sed 's/ $//')" ] || fail "Environment payload contains missing or unexpected keys."
   while IFS='=' read -r key value; do
     case "$key" in
-      HOST|NODE_ENV|PM2_APP_NAME|PORT|VITE_COMERCIO_EMPRESA_ID|VITE_COMERCIO_NOMBRE|VITE_GOOGLE_MAPS_API_KEY|VITE_METEOR_DDP_URL|VITE_METEOR_HTTP_URL) ;;
+      COMERCIO_HOST|HOST|NODE_ENV|PM2_APP_NAME|PORT|VITE_COMERCIO_EMPRESA_ID|VITE_COMERCIO_NOMBRE|VITE_GOOGLE_MAPS_API_KEY|VITE_METEOR_DDP_URL|VITE_METEOR_HTTP_URL) ;;
       *) fail "Environment payload contains an unexpected key." ;;
     esac
-    case "$value" in \"*\") ;; *) fail "Environment values must be JSON-quoted strings." ;; esac
-    case "$value" in *'"'*)
-      prefix=${value#\"}
-      case "$prefix" in *\"*)
-        suffix=${prefix##*\"}
-        [ -z "$suffix" ] || fail "Environment value has trailing data."
-        ;;
-      esac
-      ;;
-    esac
+    case "$value" in \'*\') ;; *) fail "Environment values must be single-quoted dotenv strings." ;; esac
   done < "$decoded_file"
 
-  [ "$(grep -Fxc 'HOST="127.0.0.1"' "$decoded_file")" -eq 1 ] || fail "Environment HOST is not allowed."
-  [ "$(grep -Fxc 'NODE_ENV="production"' "$decoded_file")" -eq 1 ] || fail "Environment NODE_ENV is not allowed."
+  [ "$(grep -Fxc "HOST='127.0.0.1'" "$decoded_file")" -eq 1 ] || fail "Environment HOST is not allowed."
+  [ "$(grep -Fxc "NODE_ENV='production'" "$decoded_file")" -eq 1 ] || fail "Environment NODE_ENV is not allowed."
+  [ "$(grep -Fxc "COMERCIO_HOST='$slug.vidkar.com'" "$decoded_file")" -eq 1 ] || fail "Environment commerce hostname does not match the request."
   mv "$decoded_file" "$environment_file"
   chown "$run_user:vidkar-commerce" "$environment_file"
   chmod 0600 "$environment_file"
@@ -582,18 +574,6 @@ run_npm_install() {
   directory="$(service_directory "$slug" "$request_id" "$run_user")"
   npm_binary="$(trusted_binary npm)"
   run_as_commerce "$run_user" "$directory" "$npm_binary" install -f --include=dev
-}
-
-run_npm_build() {
-  slug=$1
-  request_id=$2
-  run_user=$3
-  directory="$(service_directory "$slug" "$request_id" "$run_user")"
-  [ -s "$directory/.env" ] || fail "Commerce .env has not been created."
-  [ "$(stat -c '%U' "$directory/.env")" = "$run_user" ] || fail "Commerce .env ownership is invalid."
-  [ "$(stat -c '%a' "$directory/.env")" = "600" ] || fail "Commerce .env permissions must be 0600."
-  npm_binary="$(trusted_binary npm)"
-  run_as_commerce "$run_user" "$directory" "$npm_binary" run build
 }
 
 run_pm2_operation() {
@@ -763,10 +743,6 @@ case "$command" in
   npm-install)
     [ "$#" -eq 3 ] || fail "Usage: npm-install <slug> <request-id> <service-user>"
     run_npm_install "$@"
-    ;;
-  npm-build)
-    [ "$#" -eq 3 ] || fail "Usage: npm-build <slug> <request-id> <service-user>"
-    run_npm_build "$@"
     ;;
   pm2-start|pm2-save|pm2-delete)
     [ "$#" -eq 3 ] || fail "Usage: pm2-start|pm2-save|pm2-delete <slug> <request-id> <service-user>"

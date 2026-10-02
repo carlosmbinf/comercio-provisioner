@@ -5,12 +5,15 @@ const { dnsPointsToVps, resolveA } = require("./dns");
 const { createPrivilegedHelperRunner } = require("./privilegedHelper");
 const { createServiceUsername } = require("./serviceUser");
 
+let portAllocationQueue = Promise.resolve();
+
 const safeRequestId = (value) => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 const safeSlug = (value) => typeof value === "string" && /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])?$/.test(value);
-const cleanEnvValue = (value) => JSON.stringify(String(value ?? ""));
+const cleanEnvValue = (value) => `'${String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ")}'`;
 
-const serializeCommerceEnv = ({ displayName, ownerId, port, pm2Name, config }) => {
+const serializeCommerceEnv = ({ commerceHostname, displayName, ownerId, port, pm2Name, config }) => {
   const values = {
+    COMERCIO_HOST: commerceHostname,
     HOST: "127.0.0.1",
     NODE_ENV: "production",
     PM2_APP_NAME: pm2Name,
@@ -30,17 +33,28 @@ const isPortAvailable = (port) => new Promise((resolve) => {
   server.listen(port, "127.0.0.1", () => server.close(() => resolve(true)));
 });
 
-const findAvailablePort = async ({ config, stateStore, portProbe = isPortAvailable }) => {
-  const activeJournals = await stateStore.list();
-  const reserved = new Set(activeJournals
-    .filter((journal) => journal.state === "ACTIVE")
-    .map((journal) => Number(journal.port))
-    .filter(Number.isInteger));
+const findAvailablePort = async ({ config, onReserve = async () => {}, portProbe = isPortAvailable, stateStore }) => {
+  let releaseAllocation;
+  const previousAllocation = portAllocationQueue;
+  portAllocationQueue = new Promise((resolve) => { releaseAllocation = resolve; });
+  await previousAllocation;
 
-  for (let port = config.portRangeStart; port <= config.portRangeEnd; port += 1) {
-    if (!reserved.has(port) && await portProbe(port)) return port;
+  try {
+    const activeJournals = await stateStore.list();
+    const reserved = new Set(activeJournals
+      .filter((journal) => journal.state !== "ROLLED_BACK")
+      .map((journal) => journal.port)
+      .filter(Number.isInteger));
+
+    for (let port = config.portRangeStart; port <= config.portRangeEnd; port += 1) {
+      if (reserved.has(port) || !(await portProbe(port))) continue;
+      await onReserve(port);
+      return port;
+    }
+    throw new Error("No quedan puertos libres en el rango configurado para comercios.");
+  } finally {
+    releaseAllocation();
   }
-  throw new Error("No quedan puertos libres en el rango configurado para comercios.");
 };
 
 const assertNoTrackedEnvironmentFile = async ({ runner, siteDirectory, config }) => {
@@ -176,9 +190,15 @@ const deployRequest = async ({
     return { blockedDns: true };
   }
 
-  const port = await findAvailablePort({ config, portProbe, stateStore });
-  journal.port = port;
-  await stateStore.write(requestId, journal);
+  const port = await findAvailablePort({
+    config,
+    portProbe,
+    stateStore,
+    onReserve: async (reservedPort) => {
+      journal.port = reservedPort;
+      await stateStore.write(requestId, journal);
+    },
+  });
 
   try {
     await runStep("prepare_directory", "Preparando una carpeta aislada para este comercio.", async () => {
@@ -227,12 +247,13 @@ const deployRequest = async ({
         await stateStore.write(requestId, journal);
       });
 
-    await runStep("install_dependencies", "Instalando dependencias de producción y compilación para incluir Vite.", () =>
+    await runStep("install_dependencies", "Instalando dependencias de la tienda para iniciar Vite con PM2.", () =>
       privilegedHelper.run("npm-install", [request.slug, requestId, runUser], { timeoutMs: config.npmTimeoutMs }));
 
     await runStep("generate_environment", "Generando el .env exclusivo de esta tienda.", async () => {
       const envContent = serializeCommerceEnv({
         config,
+        commerceHostname: request.hostname,
         displayName: request.displayName,
         ownerId: request.ownerId,
         pm2Name,
@@ -249,10 +270,7 @@ const deployRequest = async ({
       await stateStore.write(requestId, journal);
     });
 
-    await runStep("build_site", "Compilando la tienda con la configuración de su empresa.", () =>
-      privilegedHelper.run("npm-build", [request.slug, requestId, runUser], { timeoutMs: config.commandTimeoutMs }));
-
-    await runStep("start_pm2", "Iniciando la versión compilada con PM2.", async () => {
+    await runStep("start_pm2", "Iniciando el servidor Vite sin compilación con PM2.", async () => {
       journal.pm2StartAttempted = true;
       await stateStore.write(requestId, journal);
       await privilegedHelper.run("pm2-start", [request.slug, requestId, runUser], { timeoutMs: config.commandTimeoutMs });

@@ -4,12 +4,14 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
+const dotenv = require("dotenv");
 
 const { loadConfig } = require("../src/config");
 const { createSafeEnvironment } = require("../src/commandRunner");
 const {
   assertNoTrackedEnvironmentFile,
   deployRequest,
+  findAvailablePort,
   serializeCommerceEnv,
 } = require("../src/deployment");
 const { dnsPointsToVps, resolveA } = require("../src/dns");
@@ -78,24 +80,57 @@ test("firma cada operación privilegiada vinculando acción y argumentos", () =>
   assert.notEqual(signature, signOperation(secret, "install-http", ["mercado-norte", "request-123"]));
 });
 
-test("genera un .env de comercio con valores VITE escapados y sin credenciales de worker", () => {
+test("genera un .env dotenv-compatible con valores escapados y sin credenciales de worker", () => {
   const output = serializeCommerceEnv({
     config: {
       commerceDdpUrl: "wss://www.vidkar.com/websocket",
       commerceGoogleMapsApiKey: "maps-public-key",
       commerceHttpUrl: "https://www.vidkar.com",
     },
-    displayName: 'Mercado "Norte"',
+    commerceHostname: "mercado-norte.vidkar.com",
+    displayName: 'Mercado "Norte" \\n',
     ownerId: "owner-123",
     pm2Name: "vidkar-comercio-mercado-norte",
     port: 5210,
   });
 
-  assert.match(output, /VITE_COMERCIO_EMPRESA_ID="owner-123"/);
-  assert.match(output, /VITE_COMERCIO_NOMBRE="Mercado \\"Norte\\""/);
-  assert.match(output, /VITE_METEOR_DDP_URL="wss:\/\/www\.vidkar\.com\/websocket"/);
-  assert.match(output, /PM2_APP_NAME="vidkar-comercio-mercado-norte"/);
+  assert.match(output, /VITE_COMERCIO_EMPRESA_ID='owner-123'/);
+  assert.match(output, /COMERCIO_HOST='mercado-norte\.vidkar\.com'/);
+  assert.match(output, /PORT='5210'/);
+  assert.match(output, /VITE_COMERCIO_NOMBRE='Mercado "Norte" \\n'/);
+  assert.match(output, /VITE_METEOR_DDP_URL='wss:\/\/www\.vidkar\.com\/websocket'/);
+  assert.match(output, /PM2_APP_NAME='vidkar-comercio-mercado-norte'/);
+  assert.equal(dotenv.parse(output).VITE_COMERCIO_NOMBRE, 'Mercado "Norte" \\n');
   assert.doesNotMatch(output, /PROVISIONER_TOKEN|MONGO_URL|CERTBOT_EMAIL/);
+});
+
+test("asigna puertos libres excluyendo tiendas activas y en curso", async () => {
+  const probed = [];
+  const port = await findAvailablePort({
+    config: { portRangeStart: 5200, portRangeEnd: 5203 },
+    portProbe: async (candidate) => { probed.push(candidate); return true; },
+    stateStore: { list: async () => [
+      { port: 5200, state: "STARTING" },
+      { port: 5201, state: "ACTIVE" },
+      { port: 5202, state: "ROLLED_BACK" },
+    ] },
+  });
+
+  assert.equal(port, 5202);
+  assert.deepEqual(probed, [5202]);
+});
+
+test("reserva puertos antes de liberar el allocator para solicitudes concurrentes", async () => {
+  const journals = [];
+  const allocate = () => findAvailablePort({
+    config: { portRangeStart: 5200, portRangeEnd: 5202 },
+    portProbe: async () => true,
+    stateStore: { list: async () => journals },
+    onReserve: async (port) => { journals.push({ port, state: "STARTING" }); },
+  });
+
+  assert.deepEqual(await Promise.all([allocate(), allocate()]), [5200, 5201]);
+  assert.deepEqual(journals.map(({ port }) => port), [5200, 5201]);
 });
 
 test("el worker se detiene antes de clonar si la resolución DNS no coincide", async () => {
@@ -215,6 +250,14 @@ test("el helper instala dependencias de desarrollo necesarias para compilar Vite
   const helper = await fs.readFile(helperPath, "utf8");
 
   assert.match(helper, /run_as_commerce "\$run_user" "\$directory" "\$npm_binary" install -f --include=dev/);
+});
+
+test("el helper exige COMERCIO_HOST igual al dominio solicitado", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+
+  assert.match(helper, /COMERCIO_HOST HOST NODE_ENV PM2_APP_NAME PORT/);
+  assert.match(helper, /COMERCIO_HOST=.*\$slug\.vidkar\.com/);
 });
 
 test("el .env de cada tienda usa el grupo vidkar-commerce creado por prepare-site", async () => {
