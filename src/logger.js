@@ -4,7 +4,7 @@ const cleanLogValue = (value, maxLength = 800) => String(value ?? "")
   .trim()
   .slice(0, maxLength);
 
-const sanitizeGitDiagnostic = (value) => cleanLogValue(value, 600)
+const sanitizeCommandDiagnostic = (value) => cleanLogValue(value, 600)
   .replace(/https?:\/\/[^\s]+/gi, (candidate) => {
     const punctuation = candidate.match(/[.,;:!?)]*$/)?.[0] || "";
     const rawUrl = candidate.slice(0, candidate.length - punctuation.length);
@@ -45,4 +45,4 @@ const createLogger = (context = {}, sink = console) => {
   };
 };
 
-module.exports = { cleanLogValue, createLogger, sanitizeGitDiagnostic };
+module.exports = { cleanLogValue, createLogger, sanitizeCommandDiagnostic };

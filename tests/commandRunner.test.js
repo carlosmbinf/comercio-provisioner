@@ -66,3 +66,21 @@ test("runner registra duración y diagnóstico Git sin filtrar credenciales", as
   assert.match(lines[1], /https:\/\/example\.test\/repo\.git/);
   assert.doesNotMatch(lines.join("\n"), /worker:secret|token=abc/);
 });
+
+test("runner registra diagnóstico sudo del helper con secretos redactados", async () => {
+  const lines = [];
+  const logger = { error: (line) => lines.push(line), info: (line) => lines.push(line) };
+  const spawnImpl = (_command, _args, options) => spawn(process.execPath, [
+    "-e",
+    "process.stderr.write('helper rejected SECRET=private-fixture Authorization: Bearer bearer-fixture'); process.exit(1)",
+  ], options);
+
+  await assert.rejects(
+    () => runCommand("sudo", ["helper", "arguments-not-logged"], { logger, spawnImpl, timeoutMs: 5000 }),
+    /sudo terminó con código 1/,
+  );
+
+  assert.match(lines[1], /CMD FAIL command=sudo exit=1 durationMs=\d+ detail=/);
+  assert.match(lines[1], /SECRET=\[redactado\]/);
+  assert.doesNotMatch(lines.join("\n"), /private-fixture|bearer-fixture|arguments-not-logged/);
+});

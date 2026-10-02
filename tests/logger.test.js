@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { createLogger, sanitizeGitDiagnostic } = require("../src/logger");
+const { createLogger, sanitizeCommandDiagnostic } = require("../src/logger");
 
 test("formatea eventos PM2 en una sola línea con contexto por tienda", () => {
   const lines = [];
@@ -21,8 +21,8 @@ test("formatea eventos PM2 en una sola línea con contexto por tienda", () => {
   assert.doesNotMatch(lines[1], /request=request-a|tienda-a/);
 });
 
-test("sanitiza diagnóstico Git y omite credenciales de URL y valores sensibles", () => {
-  const result = sanitizeGitDiagnostic(
+test("sanitiza diagnósticos de comandos y omite credenciales de URL y valores sensibles", () => {
+  const result = sanitizeCommandDiagnostic(
     "fatal: https://worker:secret@example.test/repo.git?token=abc failed\nAuthorization: Bearer bearer-secret",
   );
 
