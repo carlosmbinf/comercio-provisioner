@@ -198,9 +198,16 @@ test("el helper root rechaza operaciones y argumentos desconocidos antes de toca
 test("el helper evita str.removeprefix para ser compatible con Python 3.8", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");
+  const pythonBlock = helper.match(/python3 - "\$archive_file" "\$site_directory" <<'PY'\n([\s\S]*?)\nPY/);
 
   assert.doesNotMatch(helper, /\.removeprefix\(/);
   assert.match(helper, /name = member\.name\[2:\] if member\.name\.startswith\("\.\/"\) else member\.name/);
+  assert.ok(pythonBlock, "debe encontrar el bloque Python que materializa el archivo");
+  const parsed = spawnSync("python3", ["-c", "import ast, sys; ast.parse(sys.stdin.read())"], {
+    encoding: "utf8",
+    input: pythonBlock[1],
+  });
+  assert.equal(parsed.status, 0, parsed.stderr);
 });
 
 test("el rollback reporta cada etapa terminada sin ejecutar operaciones privilegiadas inexistentes", async () => {

@@ -679,7 +679,7 @@ def ensure_inside(target):
 
 with tarfile.open(archive_path, "r:") as archive:
     for member in archive.getmembers():
-    name = member.name[2:] if member.name.startswith("./") else member.name
+        name = member.name[2:] if member.name.startswith("./") else member.name
         if name in ("", "."):
             continue
         relative = pathlib.PurePosixPath(name)
