@@ -1,0 +1,803 @@
+#!/bin/sh
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin
+export PATH
+
+HELPER_STATE_DIR="/var/lib/vidkar-commerce-helper"
+HELPER_KEY_FILE="/etc/vidkar/commerce-helper.key"
+DEPLOY_ROOT="/opt/vidkar/comercios"
+WORKER_CHECKOUT_ROOT="/var/lib/vidkar-provisioner/state/checkouts"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+verify_signature() {
+  signature=$1
+  shift
+  case "$signature" in
+    ''|*[!a-f0-9]*) fail "Operation signature is invalid." ;;
+  esac
+  [ "${#signature}" -eq 64 ] || fail "Operation signature is invalid."
+  [ -f "$HELPER_KEY_FILE" ] && [ ! -L "$HELPER_KEY_FILE" ] || fail "Privileged helper key is not installed."
+  [ "$(stat -c '%u' "$HELPER_KEY_FILE")" -eq 0 ] || fail "Privileged helper key must be owned by root."
+  [ "$(stat -c '%u' /etc/vidkar)" -eq 0 ] && [ ! -L /etc/vidkar ] || fail "Privileged helper key directory must be root-owned and not a symlink."
+  key_mode="$(stat -c '%a' "$HELPER_KEY_FILE")"
+  case "$key_mode" in 400|600) ;; *) fail "Privileged helper key permissions must be 0400 or 0600." ;; esac
+  if ! python3 - "$HELPER_KEY_FILE" "$signature" "$@" <<'PY'
+import hashlib
+import hmac
+import pathlib
+import sys
+
+key_path, supplied_signature, *parts = sys.argv[1:]
+key = pathlib.Path(key_path).read_bytes().strip()
+message = ("\n".join(parts) + "\n").encode()
+expected_signature = hmac.new(key, message, hashlib.sha256).hexdigest()
+if len(key) < 32 or not hmac.compare_digest(supplied_signature, expected_signature):
+    raise SystemExit(1)
+PY
+  then
+    fail "Operation signature does not authorize these arguments."
+  fi
+}
+
+valid_slug() {
+  slug=$1
+  case "$slug" in
+    ''|*[!a-z0-9-]*|-*|*-) return 1 ;;
+  esac
+  case "$slug" in
+    admin|api|app|assets|cdn|comercio|dashboard|ftp|hls|mail|mobile|ns1|ns2|proxy|root|static|status|vidkar|vpn|www) return 1 ;;
+  esac
+  [ "${#slug}" -ge 3 ] && [ "${#slug}" -le 40 ]
+}
+
+valid_request_id() {
+  case "$1" in
+    ''|*[!a-zA-Z0-9_-]*) return 1 ;;
+    *) [ "${#1}" -le 128 ] ;;
+  esac
+}
+
+service_user_for_slug() {
+  printf 'vcommerce-%s' "$(printf '%s' "$1" | sha256sum | cut -c1-12)"
+}
+
+validate_service_user() {
+  slug=$1
+  run_user=$2
+  [ "$run_user" = "$(service_user_for_slug "$slug")" ] || fail "Service user does not match the requested subdomain."
+}
+
+prepare_helper_state() {
+  [ "$(id -u)" -eq 0 ] || fail "The privileged helper must run as root."
+  if [ -L "$HELPER_STATE_DIR" ]; then
+    fail "The privileged helper state directory must not be a symlink."
+  fi
+  mkdir -p "$HELPER_STATE_DIR"
+  chown root:root "$HELPER_STATE_DIR"
+  chmod 0700 "$HELPER_STATE_DIR"
+}
+
+register_request() {
+  request_id=$1
+  slug=$2
+  run_user=$3
+  prepare_helper_state
+  permit_file="$HELPER_STATE_DIR/$request_id"
+  domain_file="$HELPER_STATE_DIR/domain-$slug"
+  if [ -f "$domain_file" ]; then
+    [ "$(cat "$domain_file")" = "$request_id" ] || fail "This subdomain is already assigned to another request."
+  fi
+  if [ -f "$permit_file" ]; then
+    [ "$(sed -n '1p' "$permit_file")" = "$slug" ] || fail "Request ID is already bound to another subdomain."
+    [ "$(sed -n '2p' "$permit_file")" = "$run_user" ] || fail "Request ID is already bound to another service user."
+    return
+  fi
+  temporary_domain="$(mktemp "$HELPER_STATE_DIR/.domain.XXXXXX")"
+  printf '%s\n' "$request_id" > "$temporary_domain"
+  chown root:root "$temporary_domain"
+  chmod 0600 "$temporary_domain"
+  mv "$temporary_domain" "$domain_file"
+  temporary_permit="$(mktemp "$HELPER_STATE_DIR/.request.XXXXXX")"
+  printf '%s\n%s\n' "$slug" "$run_user" > "$temporary_permit"
+  chown root:root "$temporary_permit"
+  chmod 0600 "$temporary_permit"
+  mv "$temporary_permit" "$permit_file"
+}
+
+require_request() {
+  request_id=$1
+  slug=$2
+  run_user=$3
+  prepare_helper_state
+  permit_file="$HELPER_STATE_DIR/$request_id"
+  [ -f "$permit_file" ] || fail "No privileged registration exists for this request."
+  [ "$(sed -n '1p' "$permit_file")" = "$slug" ] || fail "Request ID is registered for a different subdomain."
+  [ "$(sed -n '2p' "$permit_file")" = "$run_user" ] || fail "Request ID is registered for a different service user."
+  [ "$(cat "$HELPER_STATE_DIR/domain-$slug")" = "$request_id" ] || fail "Subdomain is not registered to this request."
+}
+
+valid_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]
+}
+
+valid_ipv4_shape() {
+  case "$1" in ''|*[!0-9.]*|*..*|.*|*.) return 1 ;; esac
+  [ "$(printf '%s' "$1" | tr -cd '.' | wc -c | tr -d ' ')" -eq 3 ]
+}
+
+validate_paths() {
+  [ "$1" = "/etc/nginx/sites-available" ] || fail "NGINX sites-available path is not allowed."
+  [ "$2" = "/etc/nginx/sites-enabled" ] || fail "NGINX sites-enabled path is not allowed."
+  case "$3" in
+    /var/www/letsencrypt|/var/www/letsencrypt/*) ;;
+    *) fail "ACME webroot must be under /var/www/letsencrypt." ;;
+  esac
+  case "$3" in *..*|*' '*|*';'*|*'`'*|*'$'*) fail "ACME webroot contains unsafe characters." ;; esac
+}
+
+check_dns() {
+  hostname=$1
+  expected_ipv4=$2
+  valid_ipv4_shape "$expected_ipv4" || fail "Expected IPv4 is invalid."
+  resolved="$(getent ahostsv4 "$hostname" | awk '{ print $1 }' | sort -u || true)"
+  [ -n "$resolved" ] || fail "No A record resolves for the requested VIDKAR subdomain."
+  mismatched="$(printf '%s\n' "$resolved" | grep -vx "$expected_ipv4" || true)"
+  [ -z "$mismatched" ] || fail "A records do not all point to the configured VPS IPv4."
+}
+
+render_http() {
+  hostname=$1
+  port=$2
+  acme_webroot=$3
+  request_id=$4
+  cat <<EOF
+# Managed by VIDKAR commerce provisioner; request $request_id
+server {
+    listen 80;
+    server_name $hostname;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $acme_webroot;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 90s;
+    }
+}
+EOF
+}
+
+render_https() {
+  hostname=$1
+  port=$2
+  acme_webroot=$3
+  request_id=$4
+  certificate_root="/etc/letsencrypt/live/$hostname"
+  [ -s "$certificate_root/fullchain.pem" ] || fail "The certificate chain does not exist."
+  [ -s "$certificate_root/privkey.pem" ] || fail "The certificate private key does not exist."
+  cat <<EOF
+# Managed by VIDKAR commerce provisioner; request $request_id
+server {
+    listen 80;
+    server_name $hostname;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $acme_webroot;
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $hostname;
+
+    ssl_certificate $certificate_root/fullchain.pem;
+    ssl_certificate_key $certificate_root/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {
+        proxy_pass http://127.0.0.1:$port;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 90s;
+    }
+}
+EOF
+}
+
+install_site() {
+  mode=$1
+  slug=$2
+  port=$3
+  request_id=$4
+  available_dir=$5
+  enabled_dir=$6
+  acme_webroot=$7
+  expected_ipv4=$8
+  run_user=$9
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_port "$port" || fail "Application port is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  case "$run_user" in ''|root|*[!a-zA-Z0-9_-]*) fail "Service user is invalid." ;; esac
+  validate_service_user "$slug" "$run_user"
+  validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
+
+  hostname="$slug.vidkar.com"
+  check_dns "$hostname" "$expected_ipv4"
+  require_request "$request_id" "$slug" "$run_user"
+  mkdir -p "$acme_webroot/.well-known/acme-challenge"
+  chmod 0755 "$acme_webroot" "$acme_webroot/.well-known" "$acme_webroot/.well-known/acme-challenge"
+  config_file="$available_dir/$hostname.conf"
+  enabled_link="$enabled_dir/$hostname.conf"
+  marker="# Managed by VIDKAR commerce provisioner; request $request_id"
+
+  if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] || fail "An NGINX configuration path exists and is not a managed regular file."
+    grep -Fqx "$marker" "$config_file" || fail "A site configuration already exists and belongs to another task."
+  fi
+  if [ -L "$enabled_link" ]; then
+    link_target="$(readlink "$enabled_link")"
+    [ "$link_target" = "$config_file" ] || fail "An NGINX site link already exists and points elsewhere."
+  elif [ -e "$enabled_link" ]; then
+    fail "An NGINX site path already exists and is not the managed link."
+  fi
+
+  register_request "$request_id" "$slug" "$run_user"
+
+  temporary_file="$(mktemp "$available_dir/.vidkar-$slug.XXXXXX")"
+  trap 'rm -f "$temporary_file"' EXIT HUP INT TERM
+  if [ "$mode" = "http" ]; then
+    render_http "$hostname" "$port" "$acme_webroot" "$request_id" > "$temporary_file"
+  else
+    render_https "$hostname" "$port" "$acme_webroot" "$request_id" > "$temporary_file"
+  fi
+  chmod 0640 "$temporary_file"
+  mv -f "$temporary_file" "$config_file"
+  trap - EXIT HUP INT TERM
+
+  if [ ! -L "$enabled_link" ]; then
+    ln -s "$config_file" "$enabled_link"
+  fi
+  nginx -t
+  systemctl reload nginx
+}
+
+remove_nginx() {
+  slug=$1
+  request_id=$2
+  available_dir=$3
+  enabled_dir=$4
+  acme_webroot=$5
+  run_user=$6
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
+  validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
+
+  hostname="$slug.vidkar.com"
+  config_file="$available_dir/$hostname.conf"
+  enabled_link="$enabled_dir/$hostname.conf"
+  marker="# Managed by VIDKAR commerce provisioner; request $request_id"
+  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+
+  permit_file="$HELPER_STATE_DIR/$request_id"
+  if [ ! -f "$permit_file" ]; then
+    if [ -e "$config_file" ] || [ -L "$config_file" ] || [ -e "$enabled_link" ] || [ -L "$enabled_link" ] \
+      || [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
+      fail "Resources exist without a root-owned request registration; manual review is required."
+    fi
+    nginx -t
+    systemctl reload nginx
+    return 0
+  fi
+  require_request "$request_id" "$slug" "$run_user"
+
+  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  if [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
+    [ -f "$service_unit" ] && [ ! -L "$service_unit" ] || fail "Refusing to remove an unexpected systemd unit path."
+    grep -Fqx "# Managed by VIDKAR commerce provisioner; request $request_id" "$service_unit" || fail "Refusing to remove a systemd unit not owned by this request."
+    if systemctl is-active --quiet "vidkar-commerce-$slug.service"; then
+      systemctl stop "vidkar-commerce-$slug.service" || fail "Could not stop this store's systemd unit."
+    fi
+    systemctl disable "vidkar-commerce-$slug.service" >/dev/null 2>&1 || true
+    rm -f "$service_unit"
+    systemctl daemon-reload
+  fi
+
+  if [ -e "$enabled_link" ] || [ -L "$enabled_link" ]; then
+    [ -L "$enabled_link" ] || fail "Refusing to remove an unexpected NGINX enabled path."
+    link_target="$(readlink "$enabled_link")"
+    [ "$link_target" = "$config_file" ] || fail "Refusing to remove an NGINX link that points outside this request."
+    if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+      [ -f "$config_file" ] && [ ! -L "$config_file" ] || fail "Refusing to remove an unexpected NGINX configuration path."
+      grep -Fqx "$marker" "$config_file" || fail "Refusing to remove an NGINX link whose configuration is not owned by this request."
+    fi
+    rm -f "$enabled_link"
+  fi
+
+  if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+    [ -f "$config_file" ] && [ ! -L "$config_file" ] || fail "Refusing to remove an unexpected NGINX configuration path."
+    grep -Fqx "$marker" "$config_file" || fail "Refusing to remove a configuration not owned by this request."
+    rm -f "$config_file"
+  fi
+
+  # Always reconcile the active NGINX config, including a retry after file removal succeeded but reload failed.
+  nginx -t
+  systemctl reload nginx
+}
+
+remove_site() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
+  site_directory="$DEPLOY_ROOT/$slug"
+  config_file="/etc/nginx/sites-available/$slug.vidkar.com.conf"
+  enabled_link="/etc/nginx/sites-enabled/$slug.vidkar.com.conf"
+  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  domain_file="$HELPER_STATE_DIR/domain-$slug"
+  permit_file="$HELPER_STATE_DIR/$request_id"
+  if [ ! -f "$permit_file" ]; then
+    if [ -e "$site_directory" ] || [ -L "$site_directory" ] || getent passwd "$run_user" >/dev/null; then
+      fail "Site resources exist without a root-owned request registration; manual review is required."
+    fi
+    if [ "$(cat "$domain_file" 2>/dev/null || true)" = "$request_id" ]; then
+      rm -f "$domain_file"
+    fi
+    return 0
+  fi
+  require_request "$request_id" "$slug" "$run_user"
+  if [ -e "$config_file" ] || [ -L "$config_file" ] || [ -e "$enabled_link" ] || [ -L "$enabled_link" ] \
+    || [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
+    fail "Nginx/systemd resources must be removed before the site account."
+  fi
+  if [ -L "$site_directory" ]; then
+    fail "Refusing to remove a commerce site directory that is a symlink."
+  fi
+  if [ -e "$site_directory" ]; then
+    [ -d "$site_directory" ] || fail "Refusing to remove an unexpected commerce site path."
+    [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory is not owned by the registered service user."
+    rm -rf -- "$site_directory"
+  fi
+
+  checkout_directory="$WORKER_CHECKOUT_ROOT/$request_id"
+  if [ -L "$checkout_directory" ]; then
+    fail "Refusing to remove a staging checkout symlink."
+  fi
+  if [ -e "$checkout_directory" ]; then
+    [ -d "$checkout_directory" ] || fail "Refusing to remove an unexpected staging checkout path."
+    [ "$(stat -c '%U' "$checkout_directory")" = "vidkar-provisioner" ] || fail "Staging checkout has unexpected ownership."
+    rm -rf -- "$checkout_directory"
+  fi
+
+  service_home="/var/lib/vidkar-commerce/$slug"
+  if getent passwd "$run_user" >/dev/null; then
+    [ "$(printf '%s' "$(getent passwd "$run_user")" | cut -d: -f6)" = "$service_home" ] || fail "Refusing to remove a service account with an unexpected home."
+    userdel --remove "$run_user"
+  fi
+  rm -f "$permit_file"
+  [ "$(cat "$domain_file" 2>/dev/null || true)" != "$request_id" ] || rm -f "$domain_file"
+}
+
+prepare_site() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
+  getent group vidkar-commerce >/dev/null || fail "The vidkar-commerce service group does not exist."
+  install -d -o root -g root -m 0755 "$DEPLOY_ROOT"
+  install -d -o root -g root -m 0755 /var/lib/vidkar-commerce
+  service_home="/var/lib/vidkar-commerce/$slug"
+  site_directory="$DEPLOY_ROOT/$slug"
+  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  [ ! -L "$site_directory" ] || fail "Commerce site path is a symlink."
+  [ ! -e "$site_directory" ] || fail "Commerce site path already exists."
+  [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] || fail "A systemd unit already exists for this subdomain."
+  if getent passwd "$run_user" >/dev/null || [ -e "$service_home" ] || [ -L "$service_home" ]; then
+    fail "The isolated service account or home already exists; manual review is required."
+  fi
+  register_request "$request_id" "$slug" "$run_user"
+  useradd --system --create-home --home-dir "$service_home" --shell /usr/sbin/nologin --gid vidkar-commerce "$run_user"
+  user_entry="$(getent passwd "$run_user")"
+  user_home="$(printf '%s' "$user_entry" | cut -d: -f6)"
+  user_group="$(id -gn "$run_user")"
+  [ "$user_home" = "$service_home" ] && [ "$user_group" = "vidkar-commerce" ] || fail "Existing commerce service account has unexpected ownership."
+  chmod 0700 "$service_home"
+  install -d -o "$run_user" -g vidkar-commerce -m 0700 "$site_directory"
+
+  pm2_binary="$(command -v pm2)"
+  [ -x "$pm2_binary" ] || fail "PM2 executable is not installed."
+  temporary_unit="$(mktemp /etc/systemd/system/.vidkar-commerce.XXXXXX)"
+  trap 'rm -f "$temporary_unit"' EXIT HUP INT TERM
+  cat > "$temporary_unit" <<EOF
+# Managed by VIDKAR commerce provisioner; request $request_id
+[Unit]
+Description=VIDKAR commerce PM2 resurrection for $slug
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=$run_user
+Group=vidkar-commerce
+Environment=HOME=$service_home
+Environment=PM2_HOME=$service_home/.pm2
+ExecStart=$pm2_binary resurrect
+ExecStop=$pm2_binary kill
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0600 "$temporary_unit"
+  mv "$temporary_unit" "$service_unit"
+  trap - EXIT HUP INT TERM
+  systemctl daemon-reload
+}
+
+enable_pm2() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
+  require_request "$request_id" "$slug" "$run_user"
+  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  marker="# Managed by VIDKAR commerce provisioner; request $request_id"
+  [ -f "$service_unit" ] && grep -Fqx "$marker" "$service_unit" || fail "Systemd unit is not owned by this request."
+  systemctl enable "$service_unit"
+}
+
+write_site_environment() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  port=$4
+  environment_base64=$5
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  valid_port "$port" || fail "Application port is invalid."
+  validate_service_user "$slug" "$run_user"
+  require_request "$request_id" "$slug" "$run_user"
+  case "$environment_base64" in ''|*[!a-zA-Z0-9+/=]*) fail "Environment payload encoding is invalid." ;; esac
+  [ "${#environment_base64}" -le 32768 ] || fail "Environment payload is too large."
+
+  site_directory="$DEPLOY_ROOT/$slug"
+  [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || fail "Commerce site directory is missing or is a symlink."
+  [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory is not owned by the registered service user."
+  environment_file="$site_directory/.env"
+  [ ! -e "$environment_file" ] && [ ! -L "$environment_file" ] || fail "Refusing to overwrite an existing commerce .env."
+
+  decoded_file="$(mktemp "$site_directory/.env.XXXXXX")"
+  trap 'rm -f "$decoded_file"' EXIT HUP INT TERM
+  printf '%s' "$environment_base64" | base64 --decode > "$decoded_file" || fail "Environment payload is not valid base64."
+  [ "$(wc -l < "$decoded_file" | tr -d ' ')" -eq 9 ] || fail "Environment payload has an unexpected number of entries."
+
+  expected_keys="HOST NODE_ENV PM2_APP_NAME PORT VITE_COMERCIO_EMPRESA_ID VITE_COMERCIO_NOMBRE VITE_GOOGLE_MAPS_API_KEY VITE_METEOR_DDP_URL VITE_METEOR_HTTP_URL"
+  actual_keys="$(sed 's/=.*//' "$decoded_file" | sort | tr '\n' ' ' | sed 's/ $//')"
+  [ "$actual_keys" = "$(printf '%s\n' $expected_keys | sort | tr '\n' ' ' | sed 's/ $//')" ] || fail "Environment payload contains missing or unexpected keys."
+  while IFS='=' read -r key value; do
+    case "$key" in
+      HOST|NODE_ENV|PM2_APP_NAME|PORT|VITE_COMERCIO_EMPRESA_ID|VITE_COMERCIO_NOMBRE|VITE_GOOGLE_MAPS_API_KEY|VITE_METEOR_DDP_URL|VITE_METEOR_HTTP_URL) ;;
+      *) fail "Environment payload contains an unexpected key." ;;
+    esac
+    case "$value" in \"*\") ;; *) fail "Environment values must be JSON-quoted strings." ;; esac
+    case "$value" in *'"'*)
+      prefix=${value#\"}
+      case "$prefix" in *\"*)
+        suffix=${prefix##*\"}
+        [ -z "$suffix" ] || fail "Environment value has trailing data."
+        ;;
+      esac
+      ;;
+    esac
+  done < "$decoded_file"
+
+  [ "$(grep -Fxc 'HOST="127.0.0.1"' "$decoded_file")" -eq 1 ] || fail "Environment HOST is not allowed."
+  [ "$(grep -Fxc 'NODE_ENV="production"' "$decoded_file")" -eq 1 ] || fail "Environment NODE_ENV is not allowed."
+  mv "$decoded_file" "$environment_file"
+  chown "$run_user:$run_user" "$environment_file"
+  chmod 0600 "$environment_file"
+  trap - EXIT HUP INT TERM
+}
+
+service_directory() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
+  require_request "$request_id" "$slug" "$run_user"
+  directory="$DEPLOY_ROOT/$slug"
+  [ ! -L "$directory" ] && [ -d "$directory" ] || fail "Commerce site directory is missing or is a symlink."
+  [ "$(stat -c '%U' "$directory")" = "$run_user" ] || fail "Commerce site directory has unexpected ownership."
+  printf '%s\n' "$directory"
+}
+
+trusted_binary() {
+  binary_name=$1
+  candidate="$(command -v "$binary_name" || true)"
+  case "$candidate" in
+    /usr/bin/*|/usr/local/bin/*|/usr/sbin/runuser) ;;
+    *) fail "Required system binary is not installed in an approved path." ;;
+  esac
+  resolved="$(readlink -f "$candidate")"
+  [ -f "$resolved" ] && [ -x "$resolved" ] || fail "Required system binary is unavailable."
+  [ "$(stat -c '%u' "$resolved")" -eq 0 ] || fail "Required system binary must be root-owned."
+  mode="$(stat -c '%a' "$resolved")"
+  [ "$((0$mode & 0022))" -eq 0 ] || fail "Required system binary has unsafe write permissions."
+  printf '%s\n' "$resolved"
+}
+
+run_as_commerce() {
+  run_user=$1
+  site_directory=$2
+  shift 2
+  runuser_binary="$(trusted_binary runuser)"
+  environment_binary="$(trusted_binary env)"
+  service_home="$(printf '%s' "$(getent passwd "$run_user")" | cut -d: -f6)"
+  [ -n "$service_home" ] || fail "Commerce service account has no home directory."
+  "$runuser_binary" -u "$run_user" -- "$environment_binary" -i \
+    "HOME=$service_home" \
+    "PM2_HOME=$service_home/.pm2" \
+    "PATH=/usr/local/bin:/usr/bin:/bin" \
+    "NODE_ENV=production" \
+    "$environment_binary" "--chdir=$site_directory" "$@"
+}
+
+run_npm_install() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  directory="$(service_directory "$slug" "$request_id" "$run_user")"
+  npm_binary="$(trusted_binary npm)"
+  run_as_commerce "$run_user" "$directory" "$npm_binary" install -f
+}
+
+run_npm_build() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  directory="$(service_directory "$slug" "$request_id" "$run_user")"
+  [ -s "$directory/.env" ] || fail "Commerce .env has not been created."
+  [ "$(stat -c '%U' "$directory/.env")" = "$run_user" ] || fail "Commerce .env ownership is invalid."
+  [ "$(stat -c '%a' "$directory/.env")" = "600" ] || fail "Commerce .env permissions must be 0600."
+  npm_binary="$(trusted_binary npm)"
+  run_as_commerce "$run_user" "$directory" "$npm_binary" run build
+}
+
+run_pm2_operation() {
+  operation=$1
+  slug=$2
+  request_id=$3
+  run_user=$4
+  if [ "$operation" = "delete" ] && ! getent passwd "$run_user" >/dev/null; then
+    service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+    site_directory="$DEPLOY_ROOT/$slug"
+    if [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] && [ ! -e "$site_directory" ] && [ ! -L "$site_directory" ]; then
+      return 0
+    fi
+    fail "Cannot stop PM2 because the registered service account is missing while site resources remain."
+  fi
+  directory="$(service_directory "$slug" "$request_id" "$run_user")"
+  pm2_binary="$(trusted_binary pm2)"
+  request_short="$(printf '%s' "$request_id" | cut -c1-12)"
+  app_name="vidkar-comercio-$slug-$request_short"
+  case "$operation" in
+    start) run_as_commerce "$run_user" "$directory" "$pm2_binary" start ecosystem.config.cjs --only "$app_name" ;;
+    save) run_as_commerce "$run_user" "$directory" "$pm2_binary" save ;;
+    delete)
+      run_as_commerce "$run_user" "$directory" "$pm2_binary" delete "$app_name" >/dev/null 2>&1 || true
+      run_as_commerce "$run_user" "$directory" "$pm2_binary" save
+      ;;
+    *) fail "Unsupported PM2 operation." ;;
+  esac
+}
+
+materialize_site() {
+  slug=$1
+  request_id=$2
+  run_user=$3
+  validate_service_user "$slug" "$run_user"
+  require_request "$request_id" "$slug" "$run_user"
+  worker_account=vidkar-provisioner
+  checkout_directory="$WORKER_CHECKOUT_ROOT/$request_id"
+  site_directory="$DEPLOY_ROOT/$slug"
+  [ ! -L "$WORKER_CHECKOUT_ROOT" ] && [ -d "$WORKER_CHECKOUT_ROOT" ] || fail "Worker checkout root is missing or a symlink."
+  [ "$(stat -c '%U' "$WORKER_CHECKOUT_ROOT")" = "$worker_account" ] || fail "Worker checkout root has unexpected ownership."
+  [ ! -L "$checkout_directory" ] && [ -d "$checkout_directory" ] || fail "Staging checkout is missing or a symlink."
+  [ "$(stat -c '%U' "$checkout_directory")" = "$worker_account" ] || fail "Staging checkout has unexpected ownership."
+  [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || fail "Commerce site directory is missing or a symlink."
+  [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory has unexpected ownership."
+  find "$site_directory" -mindepth 1 -maxdepth 1 -print -quit | grep -q . && fail "Commerce site directory is not empty."
+
+  archive_file="$(mktemp "$HELPER_STATE_DIR/archive.XXXXXX.tar")"
+  trap 'rm -f "$archive_file"' EXIT HUP INT TERM
+  tar -C "$checkout_directory" --exclude=.git -cf "$archive_file" .
+  archive_members="$(tar -tf "$archive_file")"
+  while IFS= read -r member; do
+    [ -n "$member" ] || continue
+    case "$member" in /*|../*|*/../*) fail "Repository archive contains an unsafe path." ;; esac
+    base_name=${member##*/}
+    case "$base_name" in
+      .env|.env.*)
+        case "$base_name" in .env.example|.env.sample) ;; *) fail "The commerce repository contains a tracked .env file." ;; esac
+        ;;
+    esac
+  done <<EOF
+$archive_members
+EOF
+  python3 - "$archive_file" "$site_directory" <<'PY'
+import os
+import pathlib
+import shutil
+import sys
+import tarfile
+
+archive_path, destination = sys.argv[1:]
+root = pathlib.Path(destination).resolve()
+
+def ensure_inside(target):
+    resolved = target.resolve(strict=False)
+    if os.path.commonpath((str(root), str(resolved))) != str(root):
+        raise ValueError("archive path escapes the site directory")
+    cursor = target.parent
+    while cursor != root.parent and cursor != root:
+        if cursor.is_symlink():
+            raise ValueError("archive contains a symlink parent")
+        cursor = cursor.parent
+
+with tarfile.open(archive_path, "r:") as archive:
+    for member in archive.getmembers():
+        name = member.name.removeprefix("./")
+        if name in ("", "."):
+            continue
+        relative = pathlib.PurePosixPath(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("archive contains an unsafe path")
+        if not (member.isdir() or member.isfile()):
+            raise ValueError("archive contains a link or special file")
+        target = root.joinpath(*relative.parts)
+        ensure_inside(target)
+        if member.isdir():
+            target.mkdir(mode=0o755, parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        ensure_inside(target)
+        if target.exists() or target.is_symlink():
+            raise ValueError("archive contains a duplicate or pre-existing path")
+        stream = archive.extractfile(member)
+        if stream is None:
+            raise ValueError("archive file has no data")
+        with stream, target.open("xb") as output:
+            shutil.copyfileobj(stream, output)
+        os.chmod(target, 0o755 if member.mode & 0o111 else 0o644)
+PY
+  chown -hR "$run_user:vidkar-commerce" "$site_directory"
+  chmod 0700 "$site_directory"
+  rm -f "$archive_file"
+  trap - EXIT HUP INT TERM
+  rm -rf -- "$checkout_directory"
+}
+
+issue_certificate() {
+  slug=$1
+  port=$2
+  request_id=$3
+  email=$4
+  available_dir=$5
+  enabled_dir=$6
+  acme_webroot=$7
+  expected_ipv4=$8
+  run_user=$9
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_port "$port" || fail "Application port is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
+  validate_service_user "$slug" "$run_user"
+  case "$email" in *' '*|*';'*|*'`'*|*'$'*|*@*.*) ;; *) fail "Certbot email is invalid." ;; esac
+
+  hostname="$slug.vidkar.com"
+  config_file="$available_dir/$hostname.conf"
+  marker="# Managed by VIDKAR commerce provisioner; request $request_id"
+  [ -f "$config_file" ] && grep -Fqx "$marker" "$config_file" || fail "The HTTP challenge site is not managed by this request."
+  require_request "$request_id" "$slug" "$run_user"
+  check_dns "$hostname" "$expected_ipv4"
+  certbot certonly --webroot --webroot-path "$acme_webroot" --domain "$hostname" --email "$email" --agree-tos --non-interactive --no-eff-email --keep-until-expiring
+}
+
+[ "${1:-}" = "--signature" ] && [ "$#" -ge 3 ] || fail "An operation signature is required."
+signature=$2
+shift 2
+command=${1:-}
+shift || true
+verify_signature "$signature" "$command" "$@"
+case "$command" in
+  check-dns)
+    [ "$#" -eq 2 ] || fail "Usage: check-dns <slug> <expected-ipv4>"
+    valid_slug "$1" || fail "Subdomain slug is invalid."
+    check_dns "$1.vidkar.com" "$2"
+    ;;
+  prepare-site)
+    [ "$#" -eq 3 ] || fail "Usage: prepare-site <slug> <request-id> <service-user>"
+    prepare_site "$@"
+    ;;
+  write-env)
+    [ "$#" -eq 5 ] || fail "Usage: write-env <slug> <request-id> <service-user> <port> <base64-env>"
+    write_site_environment "$@"
+    ;;
+  materialize-site)
+      [ "$#" -eq 3 ] || fail "Usage: materialize-site <slug> <request-id> <service-user>"
+    materialize_site "$@"
+    ;;
+  npm-install)
+    [ "$#" -eq 3 ] || fail "Usage: npm-install <slug> <request-id> <service-user>"
+    run_npm_install "$@"
+    ;;
+  npm-build)
+    [ "$#" -eq 3 ] || fail "Usage: npm-build <slug> <request-id> <service-user>"
+    run_npm_build "$@"
+    ;;
+  pm2-start|pm2-save|pm2-delete)
+    [ "$#" -eq 3 ] || fail "Usage: pm2-start|pm2-save|pm2-delete <slug> <request-id> <service-user>"
+    pm2_operation=start
+    [ "$command" = "pm2-save" ] && pm2_operation=save
+    [ "$command" = "pm2-delete" ] && pm2_operation=delete
+    run_pm2_operation "$pm2_operation" "$@"
+    ;;
+  enable-pm2)
+    [ "$#" -eq 3 ] || fail "Usage: enable-pm2 <slug> <request-id> <service-user>"
+    enable_pm2 "$@"
+    ;;
+  install-http|install-https)
+    [ "$#" -eq 8 ] || fail "Usage: install-http|install-https <slug> <port> <request-id> <available-dir> <enabled-dir> <acme-webroot> <expected-ipv4> <service-user>"
+    mode=http
+    [ "$command" = "install-http" ] || mode=https
+    install_site "$mode" "$@"
+    ;;
+  issue-certificate)
+    [ "$#" -eq 9 ] || fail "Usage: issue-certificate <slug> <port> <request-id> <email> <available-dir> <enabled-dir> <acme-webroot> <expected-ipv4> <service-user>"
+    issue_certificate "$@"
+    ;;
+  remove-nginx)
+    [ "$#" -eq 6 ] || fail "Usage: remove-nginx <slug> <request-id> <available-dir> <enabled-dir> <acme-webroot> <service-user>"
+    remove_nginx "$@"
+    ;;
+  remove-site)
+    [ "$#" -eq 3 ] || fail "Usage: remove-site <slug> <request-id> <service-user>"
+    remove_site "$@"
+    ;;
+  *)
+    fail "Unsupported operation."
+    ;;
+esac
