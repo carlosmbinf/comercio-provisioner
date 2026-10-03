@@ -1,4 +1,5 @@
 const fs = require("node:fs/promises");
+const crypto = require("node:crypto");
 const net = require("node:net");
 const path = require("node:path");
 const { dnsPointsToVps, resolveA } = require("./dns");
@@ -9,6 +10,8 @@ let portAllocationQueue = Promise.resolve();
 
 const safeRequestId = (value) => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 const safeSlug = (value) => typeof value === "string" && /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])?$/.test(value);
+const certificateNameForRequest = (slug, requestId) =>
+  `vidkar-commerce-${slug}-${crypto.createHash("sha256").update(requestId).digest("hex").slice(0, 16)}`;
 const cleanEnvValue = (value) => `'${String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ")}'`;
 
 const serializeCommerceEnv = ({ commerceHostname, displayName, ownerId, port, pm2Name, config }) => {
@@ -42,7 +45,7 @@ const findAvailablePort = async ({ config, onReserve = async () => {}, portProbe
   try {
     const activeJournals = await stateStore.list();
     const reserved = new Set(activeJournals
-      .filter((journal) => journal.state !== "ROLLED_BACK")
+      .filter((journal) => !["ROLLED_BACK", "CLOSED"].includes(journal.state))
       .map((journal) => journal.port)
       .filter(Number.isInteger));
 
@@ -120,6 +123,7 @@ const deployRequest = async ({
     throw new Error("La ruta calculada de la tienda queda fuera del directorio de despliegue.");
   }
   const pm2Name = `vidkar-comercio-${request.slug}-${requestId.slice(0, 12)}`;
+  const certificateName = certificateNameForRequest(request.slug, requestId);
   const checkoutDirectory = path.join(config.stateDir, "checkouts", requestId);
   const availablePath = path.join(config.nginxSitesAvailable, `${request.hostname}.conf`);
   const enabledPath = path.join(config.nginxSitesEnabled, `${request.hostname}.conf`);
@@ -127,6 +131,7 @@ const deployRequest = async ({
     completedSteps: [],
     checkoutDirectory,
     checkoutDirectoryCreated: false,
+    certificateName,
     hostname: request.hostname,
     nginxAvailablePath: availablePath,
     nginxAvailableCreated: false,
@@ -354,6 +359,7 @@ const waitForHealth = async (url, fetchImpl = fetch, options = {}) => {
 
 module.exports = {
   assertNoTrackedEnvironmentFile,
+  certificateNameForRequest,
   createHttpResponseCheck,
   deployRequest,
   findAvailablePort,

@@ -8,8 +8,9 @@ Worker Node independiente de `react-download`. Consume tareas por DDP sobre `wss
 2. VIDKAR guarda la solicitud como `PENDIENTE_DNS`. El worker todavía no clona ni ejecuta nada.
 3. El administrador crea manualmente en Squarespace un registro DNS **A** para el host `slug`, con la IPv4 pública reportada por este worker y TTL predeterminado.
 4. En VIDKAR, el administrador principal pulsa **Verificar DNS**. El backend consulta los A records y solo libera el trabajo si todos resuelven al VPS esperado.
-5. El worker vuelve a verificar el DNS y, si sigue correcto, clona `comercio-web`, instala dependencias incluyendo Vite, crea el `.env` por tienda y arranca el servidor Vite con PM2 sin generar `dist`; luego configura Nginx, solicita el certificado y comprueba HTTPS.
+5. El worker vuelve a verificar el DNS y, si sigue correcto, clona `comercio-web`, instala dependencias incluyendo Vite, crea el `.env` por tienda y arranca el servidor Vite con PM2 sin generar `dist`; luego configura Nginx, solicita un lineage Certbot exclusivo de la solicitud y comprueba HTTPS.
 6. Al fallar una etapa, deshace en orden inverso los recursos creados por esa solicitud y reporta `FALLIDA` o `ROLLBACK_FALLIDO`. Si el proceso se reinicia, el lease vencido inicia recuperación desde el journal local.
+7. Para cerrar una web completada, el propietario o el administrador principal solicita el cierre. El worker reclama una tarea con lease, valida el journal y retira en orden PM2, Nginx/systemd, el certificado exclusivo verificable y los archivos/usuario de esa tienda.
 
 La documentación pública de Squarespace no ofrece una API de DNS. Sus Commerce APIs administran datos de tiendas Squarespace y el portal de desarrolladores marca las Reseller APIs de sitios/dominios como “Coming soon”. Referencias: `https://developers.squarespace.com/` y `https://support.squarespace.com/hc/en-us/articles/31119879125645-DNS-records-for-web-hosting`.
 
@@ -40,6 +41,7 @@ Las descargas de VIDKAR se leen de `Meteor.settings.public.empresaAppLinks`; el 
 - Si el repo es privado, instala una deploy key de solo lectura en el home de `vidkar-provisioner` (`~/.ssh`); Git clona a staging con la configuración global y del sistema deshabilitada.
 - Instala el helper root-owned en `/usr/local/sbin/vidkar-commerce-helper`. Su key HMAC root-only valida un conjunto cerrado de acciones y valores.
 - `PROVISIONER_STATE_DIR` debe ser privado (modo `0700`); el worker escribe journals y el helper crea los `.env` por tienda con modo `0600`.
+- `/opt`, `/opt/vidkar`, `/opt/vidkar/comercios`, `/var/lib/vidkar-commerce` y las carpetas de Nginx administradas deben ser directorios reales root-owned y no escribibles por grupo/otros. El helper se niega a borrar si encuentra symlinks, ownership o permisos inesperados.
 
 En la preparación manual del VPS, instala el helper desde este repositorio como `root:root` con permisos `0755`. Crea el usuario dedicado del worker y el grupo `vidkar-commerce`; mediante `visudo`, permite al worker ejecutar **solo** el helper root firmado. Git solo clona al staging como el worker; `npm install -f --include=dev` y PM2 siempre se ejecutan bajo la cuenta aislada de la tienda, sin sudo directo para esos binarios ni para ejecutar el worker como root.
 
@@ -76,4 +78,19 @@ El worker solo acepta `*.vidkar.com`; no modifica ni solicita acceso a la cuenta
 
 ## Rollback y certificados
 
-El journal registra el directorio, puerto, nombre PM2, enlace/configuración Nginx y respaldos creados. Nunca escribe el token, una contraseña Git ni el contenido completo de logs en Mongo. Un certificado que Certbot ya haya emitido no se revoca automáticamente durante el rollback; se retira el sitio y su configuración local sin afectar certificados de otras tiendas.
+El journal registra directorio, puerto, nombre PM2, certificado, enlace/configuración Nginx y los pasos completados. Nunca escribe el token, una contraseña Git ni el contenido completo de logs en Mongo. La limpieza local nunca revoca certificados ante la autoridad ACME.
+
+## Cierre seguro de una tienda
+
+- Solo se admite el cierre de una solicitud `COMPLETADA`; una instalación o un rollback en curso debe resolverse primero. El estado y el journal se conservan como auditoría y el puerto solo vuelve al pool cuando el cierre terminó.
+- El worker valida que `requestId`, slug, host, usuario, nombre PM2, puerto y rutas del journal correspondan todos a la misma tienda. No acepta rutas ni comandos de cierre enviados desde el navegador. El helper root verifica además sus registros root-owned, marcadores de propiedad y los tipos/targets de los archivos antes de borrarlos.
+- El orden es deliberado: detener el PM2 de esa tienda y confirmar que liberó su puerto; retirar únicamente su unidad systemd y sus archivos/enlaces `sites-available`/`sites-enabled` marcados con ese `requestId`; reconciliar su certificado; y solo entonces borrar `/opt/vidkar/comercios/<slug>`, el home/usuario aislado y el staging de ese `requestId`. Si el proceso se interrumpe después de retirar el código pero antes de borrar la cuenta, el reintento de PM2 opera desde el home aislado y puede recuperarse sin recrear archivos. Si una validación falla, no se ejecutan los pasos destructivos posteriores; la solicitud queda `CIERRE_FALLIDO` para revisión y reintento administrativo.
+- No se modifica `nginx.conf`, el sitio por defecto, otros archivos de Nginx, el webroot ACME compartido ni certificados de otros comercios. Nginx se valida con `nginx -t` antes de recargarlo.
+- Los certificados nuevos usan un nombre derivado de slug y solicitud y un marcador root-owned. Al cerrar, Certbot solo elimina ese lineage marcado si su SAN DNS es exactamente el host de la tienda y no está referenciado desde Nginx, Apache, Caddy, HAProxy, Traefik, lighttpd ni unidades systemd (incluidas rutas `live` y `archive`). Se preservan certificados multi-dominio, referenciados por otro servicio o imposibles de verificar. Las instalaciones antiguas no tienen prueba de ownership por `requestId`, así que sus certificados se conservan para revisión manual en lugar de inferir propiedad solo por el hostname. El progreso informa esta conservación. `certbot delete` elimina el lineage local, no revoca el certificado emitido públicamente.
+- El worker **no controla Squarespace**: el registro DNS A fue creado manualmente y no se borra al cerrar. Después del cierre, administración debe quitar manualmente solo el registro A de ese subdominio en Squarespace. No se toca la zona DNS completa.
+- Cerrar la web no elimina la empresa VIDKAR, sus tiendas del catálogo, productos, categorías, imágenes, ventas, pedidos, pagos ni datos Mongo. Las imágenes viven en el almacenamiento del backend Meteor, fuera del checkout de Vite.
+- La solicitud cerrada queda retenida para auditoría y ocupa el registro único existente del propietario/subdominio; la reapertura o creación de otra web para ese propietario no se automatiza.
+
+### Despliegue de la capacidad de cierre
+
+Antes de habilitar el botón en la web, despliega el backend Meteor actualizado e instala este helper actualizado como `root:root` en `/usr/local/sbin/vidkar-commerce-helper` con modo `0755`; después reinicia/actualiza el worker y finalmente publica la UI. El helper anterior no reconoce `remove-certificate` y fallará de forma segura, pero dejaría la solicitud en revisión con PM2/Nginx ya retirados. Prueba primero con una tienda de staging y comprueba que otro subdominio permanece disponible.

@@ -1,3 +1,5 @@
+const crypto = require("node:crypto");
+
 const validate = ({ hostname, port, acmeWebroot }) => {
   if (typeof hostname !== "string" || !/^[a-z0-9-]+\.vidkar\.com$/.test(hostname)) {
     throw new Error("Hostname no válido para generar Nginx.");
@@ -43,7 +45,9 @@ const renderHttpsNginxConfig = ({ hostname, port, acmeWebroot, requestId }) => {
   if (typeof requestId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(requestId)) {
     throw new Error("Identificador no válido para generar Nginx.");
   }
-  const certificateRoot = `/etc/letsencrypt/live/${hostname}`;
+  const slug = hostname.slice(0, -".vidkar.com".length);
+  const requestHash = crypto.createHash("sha256").update(requestId).digest("hex").slice(0, 16);
+  const certificateRoot = `/etc/letsencrypt/live/vidkar-commerce-${slug}-${requestHash}`;
   return `# Managed by VIDKAR commerce provisioner; request ${requestId}\nserver {\n    listen 80;\n    server_name ${hostname};\n\n${renderChallengeLocation(acmeWebroot)}\n    location / {\n        return 301 https://$host$request_uri;\n    }\n}\n\nserver {\n    listen 443 ssl http2;\n    server_name ${hostname};\n\n    ssl_certificate ${certificateRoot}/fullchain.pem;\n    ssl_certificate_key ${certificateRoot}/privkey.pem;\n    ssl_protocols TLSv1.2 TLSv1.3;\n\n${renderProxyLocation(port)}}\n`;
 };
 

@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment } = require("../src/worker");
+const { confirmCloseOrDefer, confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment } = require("../src/worker");
 
 test("un retry manual de rollback nunca finaliza un journal de deployment activo", () => {
   const activeJournal = { completedSteps: ["verify_site"], state: "ACTIVE" };
@@ -147,4 +147,33 @@ test("una respuesta no concluyente repetida se difiere sin rollback", async () =
   assert.equal(confirmed, false);
   assert.equal(attempts, 2);
   assert.equal(unconfirmed, 1);
+});
+
+test("un cierre incierto se reintenta una vez y se deja a recuperación sin repetir borrados", async () => {
+  let attempts = 0;
+  let deferred = 0;
+  const confirmed = await confirmCloseOrDefer({
+    finish: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("Timeout DDP");
+      return { success: true, status: "CERRADA" };
+    },
+    logger: { error() {} },
+    onUnconfirmed: () => { deferred += 1; },
+    wait: async () => {},
+  });
+  assert.equal(confirmed, true);
+  assert.equal(attempts, 2);
+  assert.equal(deferred, 0);
+
+  attempts = 0;
+  const uncertain = await confirmCloseOrDefer({
+    finish: async () => { attempts += 1; throw new Error("Timeout DDP"); },
+    logger: { error() {} },
+    onUnconfirmed: () => { deferred += 1; },
+    wait: async () => {},
+  });
+  assert.equal(uncertain, false);
+  assert.equal(attempts, 2);
+  assert.equal(deferred, 1);
 });

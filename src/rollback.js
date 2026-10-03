@@ -26,9 +26,12 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
     await report("STARTED", `${label}: iniciado.`);
     try {
       assertLease();
-      await operation();
+      const operationResult = await operation();
       assertLease();
-      await report("COMPLETED", `${label}: completado.`);
+      const completedMessage = typeof operationResult === "string"
+        ? operationResult
+        : `${label}: completado.`;
+      await report("COMPLETED", completedMessage);
       logger.info?.(`ROLLBACK OK step=${stepId} durationMs=${Date.now() - startedAt}`);
       return true;
     } catch (error) {
@@ -45,6 +48,7 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
     for (const [stepId, label] of [
       ["stop_pm2", "Detener PM2"],
       ["remove_nginx", "Retirar Nginx"],
+      ["remove_certificate", "Retirar el certificado exclusivo"],
       ["remove_site", "Eliminar la copia"],
     ]) {
       await runRollbackStep(stepId, label, async () => {});
@@ -64,7 +68,7 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
     }
   });
 
-  await runRollbackStep("remove_nginx", "Retirar Nginx", async () => {
+  const nginxRemoved = await runRollbackStep("remove_nginx", "Retirar Nginx", async () => {
     if (pm2MayBeRunning && !pm2Stopped) {
       throw new Error("Se conserva Nginx y el sitio porque no se pudo confirmar que PM2 esté detenido.");
     }
@@ -80,9 +84,37 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
     }
   });
 
+  const certificateRemoved = await runRollbackStep("remove_certificate", "Retirar el certificado exclusivo", async () => {
+    if (pm2MayBeRunning && !pm2Stopped) {
+      throw new Error("Se conserva el certificado porque no se pudo confirmar que PM2 esté detenido.");
+    }
+    if (!nginxRemoved) throw new Error("Se conserva el certificado mientras no se retire Nginx.");
+    if (journal.siteDirectoryCreated || journal.certificateIssued) {
+      const result = await privilegedHelper.run("remove-certificate", [
+        journal.slug,
+        journal.requestId,
+        config.nginxSitesAvailable,
+        config.nginxSitesEnabled,
+        journal.runUser,
+        journal.certificateIssued ? "1" : "0",
+      ], { timeoutMs: config.commandTimeoutMs });
+      const preserved = (result?.stdoutTail || "").split(/\r?\n/)
+        .filter((line) => /^CERTIFICATE_PRESERVED(?:_[A-Z_]+)?$/.test(line));
+      if (preserved.length) {
+        const message = `Certbot conservó el certificado de ${journal.hostname}; no se pudo demostrar que fuera exclusivo de esta solicitud (${[...new Set(preserved)].join(", ")}).`;
+        logger.warn?.(`[comercio-provisioner] ${message}`);
+        return message;
+      }
+      return `Se retiró el certificado exclusivo de ${journal.hostname}, o no había uno que retirar.`;
+    }
+  });
+
   await runRollbackStep("remove_site", "Eliminar la copia", async () => {
     if (pm2MayBeRunning && !pm2Stopped) {
       throw new Error("Se conserva la cuenta y el sitio porque no se pudo confirmar que PM2 esté detenido.");
+    }
+    if (!nginxRemoved || !certificateRemoved) {
+      throw new Error("Se conservan la cuenta y el sitio mientras Nginx o el certificado no estén reconciliados.");
     }
     if (journal.siteDirectoryCreated) {
       await privilegedHelper.run("remove-site", [journal.slug, journal.requestId, journal.runUser], {

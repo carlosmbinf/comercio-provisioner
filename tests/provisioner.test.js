@@ -10,14 +10,17 @@ const { loadConfig } = require("../src/config");
 const { createSafeEnvironment } = require("../src/commandRunner");
 const {
   assertNoTrackedEnvironmentFile,
+  certificateNameForRequest,
   deployRequest,
   findAvailablePort,
   serializeCommerceEnv,
 } = require("../src/deployment");
+const { closeDeployment } = require("../src/closure");
 const { dnsPointsToVps, resolveA } = require("../src/dns");
 const { renderHttpNginxConfig, renderHttpsNginxConfig } = require("../src/nginxConfig");
 const { createPrivilegedHelperRunner, signOperation } = require("../src/privilegedHelper");
 const { rollbackDeployment } = require("../src/rollback");
+const { createServiceUsername } = require("../src/serviceUser");
 const { createStateStore, isSafeRequestId } = require("../src/stateStore");
 
 const validEnvironment = (root) => ({
@@ -91,7 +94,11 @@ test("el helper privilegiado acepta acciones PM2 con dígitos y sigue rechazando
   });
 
   await helper.run("pm2-delete", ["tienda", "request-123", "vcommerce-123456789abc"]);
-  assert.equal(calls.length, 1);
+  await helper.run("remove-certificate", [
+    "tienda", "request-123", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled",
+    "vcommerce-123456789abc", "1",
+  ]);
+  assert.equal(calls.length, 2);
   assert.equal(calls[0][0], "sudo");
   assert.ok(calls[0][1].includes("pm2-delete"));
   assert.throws(() => helper.run("pm2 delete", ["tienda"]), /Operación privilegiada no válida/);
@@ -149,6 +156,161 @@ test("reserva puertos antes de liberar el allocator para solicitudes concurrente
 
   assert.deepEqual(await Promise.all([allocate(), allocate()]), [5200, 5201]);
   assert.deepEqual(journals.map(({ port }) => port), [5200, 5201]);
+});
+
+test("libera puertos de tiendas cerradas y mantiene reservados los cierres incompletos", async () => {
+  const probed = [];
+  const port = await findAvailablePort({
+    config: { portRangeStart: 5200, portRangeEnd: 5202 },
+    portProbe: async (candidate) => { probed.push(candidate); return true; },
+    stateStore: { list: async () => [
+      { port: 5200, state: "CLOSED" },
+      { port: 5201, state: "CLOSE_FAILED" },
+    ] },
+  });
+
+  assert.equal(port, 5200);
+  assert.deepEqual(probed, [5200]);
+});
+
+test("el cierre elimina solo recursos ligados al journal y conserva certificados compartidos", async () => {
+  const calls = [];
+  const reports = [];
+  const journalWrites = [];
+  const config = {
+    acmeWebroot: "/var/www/letsencrypt",
+    commandTimeoutMs: 5000,
+    deployRoot: "/opt/vidkar/comercios",
+    helperHmacSecret: "helper-secret-" + "h".repeat(48),
+    nginxSitesAvailable: "/etc/nginx/sites-available",
+    nginxSitesEnabled: "/etc/nginx/sites-enabled",
+    portRangeEnd: 5899,
+    portRangeStart: 5200,
+    privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+  };
+  const request = {
+    hostname: "mercado-norte.vidkar.com",
+    operation: "close",
+    requestId: "request-close-123",
+    slug: "mercado-norte",
+  };
+  const journal = {
+    certificateName: certificateNameForRequest(request.slug, request.requestId),
+    hostname: request.hostname,
+    nginxAvailablePath: `/etc/nginx/sites-available/${request.hostname}.conf`,
+    nginxEnabledPath: `/etc/nginx/sites-enabled/${request.hostname}.conf`,
+    pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
+    port: 5210,
+    requestId: request.requestId,
+    runUser: createServiceUsername(request.slug),
+    siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
+    siteDirectoryCreated: true,
+    slug: request.slug,
+    state: "ACTIVE",
+  };
+
+  const result = await closeDeployment({
+    config,
+    journal,
+    logger: { error() {}, info() {}, warn() {} },
+    onCloseStep: async (...report) => reports.push(report),
+    portProbe: async () => true,
+    request,
+    runner: {
+      runCommand: async (_command, args) => {
+        calls.push(args);
+        return { code: 0, stdoutTail: args[4] === "remove-certificate" ? "CERTIFICATE_PRESERVED_IN_USE\n" : "" };
+      },
+    },
+    stateStore: { write: async (_requestId, value) => journalWrites.push(value) },
+  });
+
+  assert.equal(result.closeSucceeded, true);
+  assert.equal(result.warnings.length, 1);
+  assert.deepEqual(calls.map((args) => args[4]), ["pm2-delete", "remove-nginx", "remove-certificate", "remove-site"]);
+  assert.ok(calls.every((args) => args[5] === request.slug && args[6] === request.requestId));
+  assert.deepEqual(reports.filter(([, outcome]) => outcome === "COMPLETED").map(([stepId]) => stepId), [
+    "stop_pm2", "remove_nginx", "remove_certificate", "remove_site",
+  ]);
+  assert.equal(journalWrites.at(-1).state, "CLOSED");
+  assert.equal(journalWrites.at(-1).closeWarnings.length, 1);
+});
+
+test("el cierre bloquea Nginx, certificado y archivos si PM2 no libera el puerto", async () => {
+  const calls = [];
+  const reports = [];
+  const request = {
+    hostname: "tienda-norte.vidkar.com",
+    requestId: "request-close-safe",
+    slug: "tienda-norte",
+  };
+  const result = await closeDeployment({
+    config: {
+      acmeWebroot: "/var/www/letsencrypt",
+      commandTimeoutMs: 5000,
+      deployRoot: "/opt/vidkar/comercios",
+      helperHmacSecret: "helper-secret-" + "h".repeat(48),
+      nginxSitesAvailable: "/etc/nginx/sites-available",
+      nginxSitesEnabled: "/etc/nginx/sites-enabled",
+      portRangeEnd: 5899,
+      portRangeStart: 5200,
+      privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+    },
+    journal: {
+      hostname: request.hostname,
+      nginxAvailablePath: `/etc/nginx/sites-available/${request.hostname}.conf`,
+      nginxEnabledPath: `/etc/nginx/sites-enabled/${request.hostname}.conf`,
+      pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
+      port: 5211,
+      requestId: request.requestId,
+      runUser: createServiceUsername(request.slug),
+      siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
+      slug: request.slug,
+      state: "ACTIVE",
+    },
+    logger: { error() {}, info() {}, warn() {} },
+    onCloseStep: async (...report) => reports.push(report),
+    portProbe: async () => false,
+    request,
+    runner: { runCommand: async (_command, args) => { calls.push(args); return { code: 0 }; } },
+    stateStore: { write: async () => {} },
+  });
+
+  assert.equal(result.closeSucceeded, false);
+  assert.deepEqual(calls.map((args) => args[4]), ["pm2-delete"]);
+  assert.deepEqual(reports.filter(([, outcome]) => outcome === "FAILED").map(([stepId]) => stepId), [
+    "stop_pm2", "remove_nginx", "remove_certificate", "remove_site",
+  ]);
+});
+
+test("rechaza un journal que apunta a otra tienda antes de invocar el helper root", async () => {
+  const calls = [];
+  const request = { hostname: "tienda-norte.vidkar.com", requestId: "request-close-mismatch", slug: "tienda-norte" };
+  await assert.rejects(() => closeDeployment({
+    config: {
+      deployRoot: "/opt/vidkar/comercios",
+      nginxSitesAvailable: "/etc/nginx/sites-available",
+      nginxSitesEnabled: "/etc/nginx/sites-enabled",
+      portRangeEnd: 5899,
+      portRangeStart: 5200,
+    },
+    journal: {
+      hostname: request.hostname,
+      nginxAvailablePath: "/etc/nginx/sites-available/otra.vidkar.com.conf",
+      nginxEnabledPath: `/etc/nginx/sites-enabled/${request.hostname}.conf`,
+      pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
+      port: 5212,
+      requestId: request.requestId,
+      runUser: createServiceUsername(request.slug),
+      siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
+      slug: request.slug,
+      state: "ACTIVE",
+    },
+    request,
+    runner: { runCommand: async (...args) => calls.push(args) },
+    stateStore: { write: async () => {} },
+  }), /rutas o identidades distintas/);
+  assert.equal(calls.length, 0);
 });
 
 test("el worker se detiene antes de clonar si la resolución DNS no coincide", async () => {
@@ -230,6 +392,7 @@ test("emite Nginx para host válido y rechaza hostname/payload de inyección", (
   assert.match(httpConfig, /server_name mercado-norte\.vidkar\.com/);
   assert.match(httpConfig, /127\.0\.0\.1:5210/);
   assert.match(httpsConfig, /ssl_certificate_key/);
+  assert.match(httpsConfig, new RegExp(`/etc/letsencrypt/live/${certificateNameForRequest("mercado-norte", input.requestId)}/fullchain\\.pem`));
   assert.throws(() => renderHttpNginxConfig({ ...input, hostname: "evil.example" }), /Hostname/);
   assert.throws(() => renderHttpNginxConfig({ ...input, acmeWebroot: "/tmp; include /etc/passwd" }), /Ruta ACME/);
 });
@@ -246,6 +409,35 @@ test("el helper root rechaza operaciones y argumentos desconocidos antes de toca
   const unsupported = spawnSync("sh", [helperPath, "--signature", "0".repeat(64), "shell", "id"], { encoding: "utf8" });
   assert.notEqual(unsupported.status, 0);
   assert.match(unsupported.stderr, /Privileged helper key is not installed/);
+});
+
+test("el helper limita Certbot al lineage de una solicitud y preserva certificados compartidos o referenciados", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+
+  assert.match(helper, /certificate_name_for_request\(\)/);
+  assert.match(helper, /--cert-name "\$certificate_name"/);
+  assert.match(helper, /certificate_has_only_hostname/);
+  assert.match(helper, /certificate_is_referenced\(\)/);
+  assert.match(helper, /reference_archive_root/);
+  assert.match(helper, /for config_root in \/etc\/nginx \/etc\/apache2/);
+  assert.match(helper, /reference_private_key/);
+  assert.match(helper, /CERTIFICATE_PRESERVED_UNOWNED/);
+  assert.match(helper, /validate_deploy_root\(\)/);
+  assert.match(helper, /validate_directory_not_group_writable/);
+  assert.match(helper, /run_as_commerce "\$run_user" "\$service_home" "\$pm2_binary" delete/);
+  assert.match(helper, /record_service_uid\(\)/);
+  assert.match(helper, /validate_orphaned_service_home\(\)/);
+  assert.match(helper, /getent passwd "\$orphan_uid"/);
+  assert.match(helper, /certbot delete --cert-name "\$certificate_name" --non-interactive/);
+  assert.match(helper, /CERTIFICATE_PRESERVED_SHARED_SAN/);
+  assert.match(helper, /CERTIFICATE_PRESERVED_IN_USE/);
+  assert.doesNotMatch(helper, /rm -rf[^\n]*\/etc\/letsencrypt/);
+
+  const removeNginxFunction = helper.match(/remove_nginx\(\) \{([\s\S]*?)\n\}/)?.[1];
+  const unregisteredBranch = removeNginxFunction?.match(/if \[ ! -f "\$permit_file" \]; then([\s\S]*?)\n  fi/)?.[1];
+  assert.ok(unregisteredBranch, "debe validar la rama sin registro root");
+  assert.doesNotMatch(unregisteredBranch, /nginx -t|systemctl reload nginx/);
 });
 
 test("el helper evita str.removeprefix para ser compatible con Python 3.8", async () => {
@@ -322,11 +514,60 @@ test("el rollback reporta cada etapa terminada sin ejecutar operaciones privileg
     assert.deepEqual(reports.map(([stepId, outcome]) => `${stepId}:${outcome}`), [
       "stop_pm2:STARTED", "stop_pm2:COMPLETED",
       "remove_nginx:STARTED", "remove_nginx:COMPLETED",
+      "remove_certificate:STARTED", "remove_certificate:COMPLETED",
       "remove_site:STARTED", "remove_site:COMPLETED",
     ]);
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }
+});
+
+test("el rollback informa cuando conserva un certificado no exclusivo", async () => {
+  const commands = [];
+  const reports = [];
+  const warnings = [];
+  const config = {
+    acmeWebroot: "/var/www/letsencrypt",
+    commandTimeoutMs: 5000,
+    deployRoot: "/opt/vidkar/comercios",
+    helperHmacSecret: "helper-secret-" + "h".repeat(48),
+    nginxSitesAvailable: "/etc/nginx/sites-available",
+    nginxSitesEnabled: "/etc/nginx/sites-enabled",
+    privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+    stateDir: "/var/lib/vidkar-provisioner/state",
+  };
+  const journal = {
+    certificateIssued: true,
+    hostname: "mercado-norte.vidkar.com",
+    nginxChanged: true,
+    pm2StartAttempted: false,
+    requestId: "request-shared-certificate",
+    runUser: "vcommerce-123456789abc",
+    siteDirectoryCreated: true,
+    slug: "mercado-norte",
+    state: "ROLLING_BACK",
+  };
+
+  const result = await rollbackDeployment({
+    config,
+    journal,
+    logger: { error() {}, info() {}, warn: (...entry) => warnings.push(entry) },
+    onRollbackStep: async (...report) => reports.push(report),
+    runner: {
+      runCommand: async (_command, args) => {
+        commands.push(args);
+        return { stdoutTail: args.includes("remove-certificate") ? "CERTIFICATE_PRESERVED_IN_USE\n" : "" };
+      },
+    },
+    stateStore: { write: async () => {} },
+  });
+
+  assert.equal(result.rollbackSucceeded, true);
+  assert.ok(commands.some((args) => args.includes("remove-certificate")), JSON.stringify(commands));
+  const certificateReport = reports.find(([stepId, outcome]) => stepId === "remove_certificate" && outcome === "COMPLETED");
+  assert.match(certificateReport[2], /Certbot conservó el certificado/);
+  assert.match(certificateReport[2], /CERTIFICATE_PRESERVED_IN_USE/);
+  assert.ok(warnings.some(([message]) => /Certbot conservó el certificado/.test(message)));
 });
 
 test("el rollback conserva Nginx y la cuenta si no puede confirmar que PM2 se detuvo", async () => {
@@ -363,7 +604,7 @@ test("el rollback conserva Nginx y la cuenta si no puede confirmar que PM2 se de
   assert.equal(calls.length, 1);
   assert.equal(calls[0][1][4], "pm2-delete");
   assert.deepEqual(reports.filter(([, outcome]) => outcome === "FAILED").map(([stepId]) => stepId), [
-    "stop_pm2", "remove_nginx", "remove_site",
+    "stop_pm2", "remove_nginx", "remove_certificate", "remove_site",
   ]);
 });
 
@@ -383,6 +624,7 @@ test("una recuperación de journal ya revertido vuelve a publicar los pasos como
   assert.deepEqual(reports.map(([stepId, outcome]) => `${stepId}:${outcome}`), [
     "stop_pm2:STARTED", "stop_pm2:COMPLETED",
     "remove_nginx:STARTED", "remove_nginx:COMPLETED",
+    "remove_certificate:STARTED", "remove_certificate:COMPLETED",
     "remove_site:STARTED", "remove_site:COMPLETED",
   ]);
 });

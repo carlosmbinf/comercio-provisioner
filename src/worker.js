@@ -1,11 +1,13 @@
 const { deployRequest } = require("./deployment");
 const { rollbackDeployment } = require("./rollback");
+const { closeDeployment } = require("./closure");
 const { createLogger } = require("./logger");
 const { sanitizeMessage } = require("./workerUtils");
 const { sleep } = require("./taskLock");
 
 const shouldFinishRecoveredDeployment = (task, journal) => !task.rollbackOnly
   && (journal.state === "ACTIVE" || journal.completedSteps?.includes("verify_site"));
+const CLOSE_STEP_IDS = ["stop_pm2", "remove_nginx", "remove_certificate", "remove_site"];
 
 const confirmFinishOrDefer = async ({ finish, logger = console, onUnconfirmed = () => {}, wait = sleep }) => {
   const finishConfirmed = async () => {
@@ -33,6 +35,30 @@ const confirmFinishOrDefer = async ({ finish, logger = console, onUnconfirmed = 
       throwIfStepsIncomplete(retryError);
       onUnconfirmed(retryError);
       logger.error("[comercio-provisioner] No se pudo confirmar finish después del reintento; se conservan los recursos y se esperará a reconciliar el estado con VIDKAR.");
+      return false;
+    }
+  }
+};
+
+const confirmCloseOrDefer = async ({ finish, logger = console, onUnconfirmed = () => {}, wait = sleep }) => {
+  const finishConfirmed = async () => {
+    const result = await finish();
+    if (result?.success === true && result?.status === "CERRADA") return result;
+    const error = new Error("El servidor no confirmó el cierre de la tienda.");
+    error.code = "CLOSE_UNCONFIRMED";
+    throw error;
+  };
+  try {
+    await finishConfirmed();
+    return true;
+  } catch (_firstError) {
+    try {
+      await wait(500);
+      await finishConfirmed();
+      return true;
+    } catch (_retryError) {
+      onUnconfirmed(_retryError);
+      logger.error("[comercio-provisioner] No se pudo confirmar el cierre después del reintento; no se repetirá fuera de la recuperación con lease.");
       return false;
     }
   }
@@ -72,6 +98,7 @@ const startWorker = ({
   taskLock,
   deploy = deployRequest,
   rollback = rollbackDeployment,
+  close = closeDeployment,
 }) => {
   const rootLogger = createLogger({ workerId: config.workerId }, logger);
   let stopping = false;
@@ -358,6 +385,129 @@ const startWorker = ({
     }
   };
 
+  const processClosure = async (task) => {
+    const taskLogger = rootLogger.child({
+      flow: "close",
+      hostname: task.hostname,
+      requestId: task.requestId,
+      slug: task.slug,
+    });
+    taskLogger.info("FLOW START cierre de tienda");
+    setActiveTask(task);
+    let lock;
+    const fencedClient = createFencedClient({ assertLease, client, config, onLeaseLost: markLeaseLost, task });
+    const finishClose = (success, message = "") => fencedClient.call(
+      "comercio.provisioning.worker.finishClose",
+      config.token,
+      config.workerId,
+      task.requestId,
+      success,
+      message,
+    );
+
+    try {
+      lock = await acquireTaskLock(task.requestId);
+      assertLease();
+      const taskRunner = createTaskRunner(lock, taskLogger);
+      await fencedClient.call(
+        "comercio.provisioning.worker.heartbeat",
+        config.token,
+        config.workerId,
+        task.requestId,
+      );
+      const journal = await stateStore.read(task.requestId);
+      if (!journal) {
+        const message = "No existe journal local; no se puede confirmar la propiedad de los recursos y no se eliminó nada.";
+        for (const stepId of CLOSE_STEP_IDS) {
+          await fencedClient.call(
+            "comercio.provisioning.worker.reportCloseStep",
+            config.token,
+            config.workerId,
+            task.requestId,
+            stepId,
+            "STARTED",
+            "No se ejecutó: falta el journal de propiedad de esta tienda.",
+          );
+          await fencedClient.call(
+            "comercio.provisioning.worker.reportCloseStep",
+            config.token,
+            config.workerId,
+            task.requestId,
+            stepId,
+            "FAILED",
+            "No se ejecutó: requiere revisión manual porque falta el journal.",
+          );
+        }
+        await finishClose(false, message);
+        taskLogger.error("CLOSE FAIL journal local ausente; requiere revisión manual");
+        return;
+      }
+
+      const result = await close({
+        assertLease,
+        config,
+        journal,
+        logger: taskLogger,
+        onCloseStep: (stepId, outcome, message) => fencedClient.call(
+          "comercio.provisioning.worker.reportCloseStep",
+          config.token,
+          config.workerId,
+          task.requestId,
+          stepId,
+          outcome,
+          message,
+        ),
+        request: task,
+        runner: taskRunner,
+        stateStore,
+      });
+
+      if (!result.closeSucceeded) {
+        const finishResult = await finishClose(false, result.errors.join(" "));
+        if (finishResult?.status !== "CIERRE_FALLIDO") {
+          throw new Error("VIDKAR no confirmó que el cierre requiere revisión manual.");
+        }
+        taskLogger.error("CLOSE NEEDS_REVIEW el cierre quedó parcialmente realizado; se requiere inspección antes de reintentar");
+        return;
+      }
+
+      const finishConfirmed = await confirmCloseOrDefer({
+        finish: () => finishClose(true),
+        logger: taskLogger,
+        onUnconfirmed: () => {
+          activeLeaseLost = true;
+          activeAbortController?.abort();
+        },
+      });
+      if (!finishConfirmed) return;
+      taskLogger.info("FLOW OK cierre confirmado por VIDKAR");
+    } catch (error) {
+      if (error?.code === "TASK_LOCK_BUSY") {
+        taskLogger.warn("CLOSE SKIP otra ejecución local posee el lock");
+        return;
+      }
+      if (activeLeaseLost || error?.error === "provisioner-lease-lost" || error?.code === "WORKER_LEASE_LOST") {
+        activeLeaseLost = true;
+        activeAbortController?.abort();
+        taskLogger.warn("CLOSE ABORTED lease perdido; la recuperación queda para el siguiente propietario");
+        return;
+      }
+      const message = sanitizeMessage(error?.message || "Falló el cierre de la tienda.");
+      taskLogger.error(`CLOSE FAIL reason=${message}; requiere revisión`);
+      try {
+        const finishResult = await finishClose(false, message);
+        if (finishResult?.status !== "CIERRE_FALLIDO") {
+          taskLogger.warn("CLOSE REPORT_FAILED VIDKAR no confirmó el estado de revisión; el lease permitirá recuperar la tarea");
+        }
+      } catch (_reportError) {
+        taskLogger.warn("CLOSE REPORT_FAILED el lease vigente permitirá recuperar la tarea");
+      }
+    } finally {
+      await lock?.release();
+      clearActiveTask();
+    }
+  };
+
   const sendHeartbeat = async () => {
     if (heartbeatBusy) return;
     heartbeatBusy = true;
@@ -397,7 +547,8 @@ const startWorker = ({
             continue;
           }
           if (!task.leaseToken) throw new Error("El backend no asignó un fencing token al trabajo.");
-          if (task.recoveryRequired) await processRecovery(task);
+          if (task.operation === "close") await processClosure(task);
+          else if (task.recoveryRequired) await processRecovery(task);
           else await processDeployment(task);
         } catch (error) {
           rootLogger.warn(`QUEUE FAIL reason=${sanitizeMessage(error?.message || "error de conexión")}`);
@@ -418,4 +569,4 @@ const startWorker = ({
   };
 };
 
-module.exports = { confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment, startWorker };
+module.exports = { confirmCloseOrDefer, confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment, startWorker };

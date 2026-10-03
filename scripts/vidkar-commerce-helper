@@ -71,6 +71,55 @@ validate_service_user() {
   [ "$run_user" = "$(service_user_for_slug "$slug")" ] || fail "Service user does not match the requested subdomain."
 }
 
+certificate_name_for_request() {
+  slug=$1
+  request_id=$2
+  request_hash="$(printf '%s' "$request_id" | sha256sum | cut -c1-16)"
+  printf 'vidkar-commerce-%s-%s' "$slug" "$request_hash"
+}
+
+certificate_has_only_hostname() {
+  certificate_file=$1
+  hostname=$2
+  python3 - "$certificate_file" "$hostname" <<'PY'
+import ssl
+import sys
+
+try:
+    certificate = ssl._ssl._test_decode_cert(sys.argv[1])
+except Exception:
+    raise SystemExit(2)
+
+names = [value.rstrip(".").lower() for kind, value in certificate.get("subjectAltName", ()) if kind == "DNS"]
+raise SystemExit(0 if len(names) == 1 and names[0] == sys.argv[2].lower() else 1)
+PY
+}
+
+certificate_is_referenced() {
+  reference_cert_name=$1
+  reference_live_root="/etc/letsencrypt/live/$reference_cert_name/"
+  reference_archive_root="/etc/letsencrypt/archive/$reference_cert_name/"
+  reference_fullchain="$(readlink -f "/etc/letsencrypt/live/$reference_cert_name/fullchain.pem" 2>/dev/null || true)"
+  reference_private_key="$(readlink -f "/etc/letsencrypt/live/$reference_cert_name/privkey.pem" 2>/dev/null || true)"
+
+  for reference_path in "$reference_live_root" "$reference_archive_root" "$reference_fullchain" "$reference_private_key"; do
+    [ -n "$reference_path" ] || continue
+    for config_root in /etc/nginx /etc/apache2 /etc/httpd /etc/caddy /etc/haproxy /etc/traefik /etc/lighttpd /etc/systemd/system; do
+      [ -e "$config_root" ] || continue
+      if [ -L "$config_root" ] || [ ! -d "$config_root" ]; then
+        return 2
+      fi
+      if grep -R -F -q -- "$reference_path" "$config_root"; then
+        return 0
+      else
+        reference_grep_status=$?
+        [ "$reference_grep_status" -eq 1 ] || return 2
+      fi
+    done
+  done
+  return 1
+}
+
 prepare_helper_state() {
   [ "$(id -u)" -eq 0 ] || fail "The privileged helper must run as root."
   if [ -L "$HELPER_STATE_DIR" ]; then
@@ -120,6 +169,30 @@ require_request() {
   [ "$(cat "$HELPER_STATE_DIR/domain-$slug")" = "$request_id" ] || fail "Subdomain is not registered to this request."
 }
 
+valid_service_uid() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -gt 0 ]
+}
+
+record_service_uid() {
+  request_id=$1
+  slug=$2
+  run_user=$3
+  require_request "$request_id" "$slug" "$run_user"
+  permit_file="$HELPER_STATE_DIR/$request_id"
+  service_uid="$(id -u "$run_user")"
+  valid_service_uid "$service_uid" || fail "Commerce service account has an invalid UID."
+  recorded_uid="$(sed -n '3p' "$permit_file")"
+  if [ -n "$recorded_uid" ] && [ "$recorded_uid" != "$service_uid" ]; then
+    fail "Commerce service UID does not match its root-owned registration."
+  fi
+  temporary_permit="$(mktemp "$HELPER_STATE_DIR/.request.XXXXXX")"
+  printf '%s\n%s\n%s\n' "$slug" "$run_user" "$service_uid" > "$temporary_permit"
+  chown root:root "$temporary_permit"
+  chmod 0600 "$temporary_permit"
+  mv "$temporary_permit" "$permit_file"
+}
+
 valid_port() {
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
   [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]
@@ -138,6 +211,65 @@ validate_paths() {
     *) fail "ACME webroot must be under /var/www/letsencrypt." ;;
   esac
   case "$3" in *..*|*' '*|*';'*|*'`'*|*'$'*) fail "ACME webroot contains unsafe characters." ;; esac
+}
+
+validate_directory_not_group_writable() {
+  permission_directory=$1
+  permission_mode="$(stat -c '%a' "$permission_directory")"
+  [ "$((0$permission_mode & 0022))" -eq 0 ] \
+    || fail "A managed parent directory is writable by group or other users."
+}
+
+validate_service_home_parent() {
+  [ ! -L /var/lib ] && [ -d /var/lib ] && [ "$(stat -c '%U' /var/lib)" = root ] \
+    || fail "The system library root is not a root-owned real directory."
+  validate_directory_not_group_writable /var/lib
+  service_home_parent="/var/lib/vidkar-commerce"
+  [ ! -L "$service_home_parent" ] && [ -d "$service_home_parent" ] \
+    && [ "$(stat -c '%U' "$service_home_parent")" = root ] \
+    || fail "Commerce service home parent is not a root-owned real directory."
+  validate_directory_not_group_writable "$service_home_parent"
+}
+
+validate_orphaned_service_home() {
+  orphan_uid=$1
+  service_home=$2
+  valid_service_uid "$orphan_uid" || fail "Orphaned service home has no valid request-owned UID."
+  if getent passwd "$orphan_uid" >/dev/null; then
+    fail "The recorded service UID was reassigned; refusing to remove its home."
+  fi
+  validate_service_home_parent
+  [ ! -L "$service_home" ] && [ -d "$service_home" ] \
+    && [ "$(stat -c '%u' "$service_home")" = "$orphan_uid" ] \
+    || fail "Orphaned service home does not match the root-owned request UID."
+}
+
+validate_nginx_directories() {
+  [ ! -L /etc/nginx ] && [ -d /etc/nginx ] && [ "$(stat -c '%U' /etc/nginx)" = root ] \
+    || fail "The NGINX configuration root is not a root-owned directory."
+  validate_directory_not_group_writable /etc/nginx
+  for directory in "$1" "$2"; do
+    [ ! -L "$directory" ] && [ -d "$directory" ] && [ "$(stat -c '%U' "$directory")" = root ] \
+      || fail "An NGINX site directory is not a root-owned real directory."
+    validate_directory_not_group_writable "$directory"
+  done
+}
+
+validate_deploy_root() {
+  for directory in /opt /opt/vidkar; do
+    [ ! -L "$directory" ] || fail "Commerce deployment parent is a symlink."
+    if [ -e "$directory" ]; then
+      [ -d "$directory" ] && [ "$(stat -c '%U' "$directory")" = root ] \
+        || fail "Commerce deployment parent is not a root-owned real directory."
+      validate_directory_not_group_writable "$directory"
+    fi
+  done
+  [ ! -L "$DEPLOY_ROOT" ] || fail "Commerce deployment root is a symlink."
+  if [ -e "$DEPLOY_ROOT" ]; then
+    [ -d "$DEPLOY_ROOT" ] && [ "$(stat -c '%U' "$DEPLOY_ROOT")" = root ] \
+      || fail "Commerce deployment root is not a root-owned real directory."
+    validate_directory_not_group_writable "$DEPLOY_ROOT"
+  fi
 }
 
 check_dns() {
@@ -187,7 +319,9 @@ render_https() {
   port=$2
   acme_webroot=$3
   request_id=$4
-  certificate_root="/etc/letsencrypt/live/$hostname"
+  slug=${hostname%.vidkar.com}
+  certificate_name="$(certificate_name_for_request "$slug" "$request_id")"
+  certificate_root="/etc/letsencrypt/live/$certificate_name"
   [ -s "$certificate_root/fullchain.pem" ] || fail "The certificate chain does not exist."
   [ -s "$certificate_root/privkey.pem" ] || fail "The certificate private key does not exist."
   cat <<EOF
@@ -246,6 +380,7 @@ install_site() {
   case "$run_user" in ''|root|*[!a-zA-Z0-9_-]*) fail "Service user is invalid." ;; esac
   validate_service_user "$slug" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
+  validate_nginx_directories "$available_dir" "$enabled_dir"
 
   hostname="$slug.vidkar.com"
   check_dns "$hostname" "$expected_ipv4"
@@ -298,6 +433,7 @@ remove_nginx() {
   valid_request_id "$request_id" || fail "Request ID is invalid."
   validate_service_user "$slug" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
+  validate_nginx_directories "$available_dir" "$enabled_dir"
 
   hostname="$slug.vidkar.com"
   config_file="$available_dir/$hostname.conf"
@@ -311,8 +447,6 @@ remove_nginx() {
       || [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
       fail "Resources exist without a root-owned request registration; manual review is required."
     fi
-    nginx -t
-    systemctl reload nginx
     return 0
   fi
   require_request "$request_id" "$slug" "$run_user"
@@ -351,6 +485,174 @@ remove_nginx() {
   systemctl reload nginx
 }
 
+remove_certificate() {
+  slug=$1
+  request_id=$2
+  available_dir=$3
+  enabled_dir=$4
+  run_user=$5
+  allow_legacy=$6
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
+  validate_paths "$available_dir" "$enabled_dir" "/var/www/letsencrypt"
+  validate_nginx_directories "$available_dir" "$enabled_dir"
+  case "$allow_legacy" in 0|1) ;; *) fail "Legacy certificate cleanup flag is invalid." ;; esac
+
+  hostname="$slug.vidkar.com"
+  config_file="$available_dir/$hostname.conf"
+  enabled_link="$enabled_dir/$hostname.conf"
+  permit_file="$HELPER_STATE_DIR/$request_id"
+  certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
+  if [ -e "$config_file" ] || [ -L "$config_file" ] || [ -e "$enabled_link" ] || [ -L "$enabled_link" ]; then
+    fail "Refusing to remove a certificate while the requested NGINX site still exists."
+  fi
+
+  if [ ! -f "$permit_file" ]; then
+    if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+      fail "Certificate ownership exists without a matching root-owned request registration."
+    fi
+    return 0
+  fi
+  require_request "$request_id" "$slug" "$run_user"
+
+  owned_certificate_name=""
+  if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+    [ -f "$certificate_marker" ] && [ ! -L "$certificate_marker" ] || fail "Certificate ownership marker is not a regular file."
+    expected_certificate_name="$(certificate_name_for_request "$slug" "$request_id")"
+    [ "$(sed -n '1p' "$certificate_marker")" = "$slug" ] \
+      && [ "$(sed -n '2p' "$certificate_marker")" = "$hostname" ] \
+      && [ "$(sed -n '3p' "$certificate_marker")" = "$expected_certificate_name" ] \
+      || fail "Certificate ownership marker does not match this request."
+    owned_certificate_name=$expected_certificate_name
+  elif [ "$allow_legacy" = "1" ]; then
+    printf '%s\n' "CERTIFICATE_PRESERVED_UNOWNED"
+    return 0
+  else
+    return 0
+  fi
+
+  if [ -L /etc/letsencrypt ]; then
+    fail "Certbot root is a symlink; certificate cleanup requires manual review."
+  fi
+  if [ -e /etc/letsencrypt ]; then
+    [ -d /etc/letsencrypt ] && [ "$(stat -c '%U' /etc/letsencrypt)" = root ] \
+      || fail "Certbot root is not a root-owned real directory."
+  fi
+  renewal_dir="/etc/letsencrypt/renewal"
+  if [ -L "$renewal_dir" ]; then
+    fail "Certbot renewal directory is a symlink; certificate cleanup requires manual review."
+  fi
+  if [ -e "$renewal_dir" ] && [ ! -d "$renewal_dir" ]; then
+    fail "Certbot renewal path is not a directory; certificate cleanup requires manual review."
+  fi
+  if [ -e "$renewal_dir" ] && [ "$(stat -c '%U' "$renewal_dir")" != root ]; then
+    fail "Certbot renewal directory is not root-owned."
+  fi
+  live_dir="/etc/letsencrypt/live"
+  archive_dir="/etc/letsencrypt/archive"
+  for certificate_parent in "$live_dir" "$archive_dir"; do
+    if [ -L "$certificate_parent" ]; then
+      fail "A Certbot lineage parent is a symlink; certificate cleanup requires manual review."
+    fi
+    if [ -e "$certificate_parent" ]; then
+      [ -d "$certificate_parent" ] && [ "$(stat -c '%U' "$certificate_parent")" = root ] \
+        || fail "A Certbot lineage parent is not a root-owned real directory."
+    fi
+  done
+  owned_certificate_found=0
+  for renewal_config in "$renewal_dir"/*.conf; do
+    [ -e "$renewal_config" ] || continue
+    certificate_name=${renewal_config##*/}
+    certificate_name=${certificate_name%.conf}
+    case "$certificate_name" in
+      ''|*[!a-zA-Z0-9._-]*|*..*)
+        if [ "$certificate_name" = "$owned_certificate_name" ]; then
+          fail "The owned Certbot lineage has an unsafe name."
+        fi
+        continue
+        ;;
+    esac
+    if [ "$certificate_name" = "$owned_certificate_name" ]; then
+      owned_certificate_found=1
+    else
+      continue
+    fi
+    if [ ! -f "$renewal_config" ] || [ -L "$renewal_config" ]; then
+      if [ "$certificate_name" = "$owned_certificate_name" ]; then
+        fail "The owned Certbot renewal record is not a regular file."
+      fi
+      printf '%s\n' "CERTIFICATE_PRESERVED_UNVERIFIABLE"
+      continue
+    fi
+
+    certificate_file="/etc/letsencrypt/live/$certificate_name/cert.pem"
+    certificate_live_root="/etc/letsencrypt/live/$certificate_name"
+    certificate_archive_root="/etc/letsencrypt/archive/$certificate_name"
+    if [ -L "$certificate_live_root" ] || [ -L "$certificate_archive_root" ]; then
+      fail "The request-owned Certbot lineage contains a symlinked directory."
+    fi
+    if [ -e "$certificate_live_root" ]; then
+      [ -d "$certificate_live_root" ] && [ "$(stat -c '%U' "$certificate_live_root")" = root ] \
+        || fail "The request-owned live lineage is not a root-owned real directory."
+    fi
+    if [ -e "$certificate_archive_root" ]; then
+      [ -d "$certificate_archive_root" ] && [ "$(stat -c '%U' "$certificate_archive_root")" = root ] \
+        || fail "The request-owned archive lineage is not a root-owned real directory."
+    fi
+    if [ ! -s "$certificate_file" ]; then
+      if [ "$certificate_name" = "$owned_certificate_name" ]; then
+        fail "The owned Certbot lineage is incomplete; refusing automatic deletion."
+      fi
+      printf '%s\n' "CERTIFICATE_PRESERVED_UNVERIFIABLE"
+      continue
+    fi
+    if certificate_has_only_hostname "$certificate_file" "$hostname"; then
+      :
+    else
+      certificate_status=$?
+      if [ "$certificate_status" -eq 1 ]; then
+        printf '%s\n' "CERTIFICATE_PRESERVED_SHARED_SAN"
+      else
+        printf '%s\n' "CERTIFICATE_PRESERVED_UNVERIFIABLE"
+      fi
+      continue
+    fi
+
+    if certificate_is_referenced "$certificate_name"; then
+      printf '%s\n' "CERTIFICATE_PRESERVED_IN_USE"
+      continue
+    else
+      reference_status=$?
+      if [ "$reference_status" -ne 1 ]; then
+        printf '%s\n' "CERTIFICATE_PRESERVED_UNVERIFIABLE"
+        continue
+      fi
+    fi
+
+    certbot delete --cert-name "$certificate_name" --non-interactive \
+      || fail "Certbot could not remove an exclusive certificate lineage."
+    [ ! -e "$renewal_config" ] && [ ! -L "$renewal_config" ] \
+      || fail "Certbot did not remove the requested certificate lineage."
+    [ ! -e "$certificate_live_root" ] && [ ! -L "$certificate_live_root" ] \
+      || fail "Certbot left files in the live lineage; manual review is required."
+    [ ! -e "$certificate_archive_root" ] && [ ! -L "$certificate_archive_root" ] \
+      || fail "Certbot left files in the archive lineage; manual review is required."
+  done
+
+  if [ -n "$owned_certificate_name" ] && [ "$owned_certificate_found" -eq 0 ]; then
+    owned_live_root="/etc/letsencrypt/live/$owned_certificate_name"
+    owned_archive_root="/etc/letsencrypt/archive/$owned_certificate_name"
+    if [ -e "$owned_live_root" ] || [ -L "$owned_live_root" ] \
+      || [ -e "$owned_archive_root" ] || [ -L "$owned_archive_root" ]; then
+      fail "The owned certificate files exist without a matching renewal record."
+    fi
+  fi
+  if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+    rm -f "$certificate_marker"
+  fi
+}
+
 remove_site() {
   slug=$1
   request_id=$2
@@ -364,9 +666,16 @@ remove_site() {
   service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
   domain_file="$HELPER_STATE_DIR/domain-$slug"
   permit_file="$HELPER_STATE_DIR/$request_id"
+  certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
+  service_home="/var/lib/vidkar-commerce/$slug"
   if [ ! -f "$permit_file" ]; then
-    if [ -e "$site_directory" ] || [ -L "$site_directory" ] || getent passwd "$run_user" >/dev/null; then
+    if [ -e "$site_directory" ] || [ -L "$site_directory" ] \
+      || [ -e "$service_home" ] || [ -L "$service_home" ] \
+      || getent passwd "$run_user" >/dev/null; then
       fail "Site resources exist without a root-owned request registration; manual review is required."
+    fi
+    if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+      fail "Certificate ownership remains without a root-owned request registration; manual review is required."
     fi
     if [ "$(cat "$domain_file" 2>/dev/null || true)" = "$request_id" ]; then
       rm -f "$domain_file"
@@ -374,6 +683,10 @@ remove_site() {
     return 0
   fi
   require_request "$request_id" "$slug" "$run_user"
+  validate_deploy_root
+  if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+    fail "Certificate ownership must be reconciled before removing the service account."
+  fi
   if [ -e "$config_file" ] || [ -L "$config_file" ] || [ -e "$enabled_link" ] || [ -L "$enabled_link" ] \
     || [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
     fail "Nginx/systemd resources must be removed before the site account."
@@ -381,26 +694,75 @@ remove_site() {
   if [ -L "$site_directory" ]; then
     fail "Refusing to remove a commerce site directory that is a symlink."
   fi
+  site_exists=0
   if [ -e "$site_directory" ]; then
     [ -d "$site_directory" ] || fail "Refusing to remove an unexpected commerce site path."
     [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory is not owned by the registered service user."
-    rm -rf -- "$site_directory"
+    site_exists=1
   fi
 
   checkout_directory="$WORKER_CHECKOUT_ROOT/$request_id"
   if [ -L "$checkout_directory" ]; then
     fail "Refusing to remove a staging checkout symlink."
   fi
+  checkout_exists=0
   if [ -e "$checkout_directory" ]; then
+    [ ! -L /var/lib ] && [ -d /var/lib ] && [ "$(stat -c '%U' /var/lib)" = root ] \
+      || fail "The system library root is not a root-owned real directory."
+    validate_directory_not_group_writable /var/lib
+    for checkout_parent in /var/lib/vidkar-provisioner /var/lib/vidkar-provisioner/state "$WORKER_CHECKOUT_ROOT"; do
+      [ ! -L "$checkout_parent" ] && [ -d "$checkout_parent" ] \
+        || fail "Worker staging parent is not a real directory."
+      [ "$(stat -c '%U' "$checkout_parent")" = "vidkar-provisioner" ] \
+        || fail "Worker staging parent has unexpected ownership."
+      validate_directory_not_group_writable "$checkout_parent"
+    done
     [ -d "$checkout_directory" ] || fail "Refusing to remove an unexpected staging checkout path."
     [ "$(stat -c '%U' "$checkout_directory")" = "vidkar-provisioner" ] || fail "Staging checkout has unexpected ownership."
-    rm -rf -- "$checkout_directory"
+    checkout_exists=1
   fi
 
-  service_home="/var/lib/vidkar-commerce/$slug"
+  service_account_exists=0
+  orphaned_service_home=0
   if getent passwd "$run_user" >/dev/null; then
     [ "$(printf '%s' "$(getent passwd "$run_user")" | cut -d: -f6)" = "$service_home" ] || fail "Refusing to remove a service account with an unexpected home."
+    validate_service_home_parent
+    if [ -L "$service_home" ]; then
+      fail "Commerce service home is a symlink."
+    fi
+    if [ -e "$service_home" ]; then
+      [ -d "$service_home" ] && [ "$(stat -c '%U' "$service_home")" = "$run_user" ] \
+        || fail "Commerce service home has unexpected ownership."
+      service_uid="$(id -u "$run_user")"
+      [ "$(stat -c '%u' "$service_home")" = "$service_uid" ] \
+        || fail "Commerce service home UID does not match its account."
+    fi
+    record_service_uid "$request_id" "$slug" "$run_user"
+    service_account_exists=1
+  elif [ -e "$service_home" ] || [ -L "$service_home" ]; then
+    recorded_service_uid="$(sed -n '3p' "$permit_file")"
+    validate_orphaned_service_home "$recorded_service_uid" "$service_home"
+    orphaned_service_home=1
+  fi
+
+  if [ "$checkout_exists" -eq 1 ]; then
+    rm -rf -- "$checkout_directory"
+  fi
+  if [ "$site_exists" -eq 1 ]; then
+    rm -rf -- "$site_directory"
+  fi
+  if [ "$service_account_exists" -eq 1 ]; then
     userdel --remove "$run_user"
+    if getent passwd "$run_user" >/dev/null; then
+      fail "The commerce service account remains after userdel; manual review is required."
+    fi
+    if [ -e "$service_home" ] || [ -L "$service_home" ]; then
+      recorded_service_uid="$(sed -n '3p' "$permit_file")"
+      validate_orphaned_service_home "$recorded_service_uid" "$service_home"
+      rm -rf -- "$service_home"
+    fi
+  elif [ "$orphaned_service_home" -eq 1 ]; then
+    rm -rf -- "$service_home"
   fi
   rm -f "$permit_file"
   [ "$(cat "$domain_file" 2>/dev/null || true)" != "$request_id" ] || rm -f "$domain_file"
@@ -414,8 +776,14 @@ prepare_site() {
   valid_request_id "$request_id" || fail "Request ID is invalid."
   validate_service_user "$slug" "$run_user"
   getent group vidkar-commerce >/dev/null || fail "The vidkar-commerce service group does not exist."
+  validate_deploy_root
+  [ ! -L /var/lib ] && [ -d /var/lib ] && [ "$(stat -c '%U' /var/lib)" = root ] \
+    || fail "The system library root is not a root-owned real directory."
+  validate_directory_not_group_writable /var/lib
+  [ ! -L /var/lib/vidkar-commerce ] || fail "Commerce service home parent is a symlink."
   install -d -o root -g root -m 0755 "$DEPLOY_ROOT"
   install -d -o root -g root -m 0755 /var/lib/vidkar-commerce
+  validate_service_home_parent
   service_home="/var/lib/vidkar-commerce/$slug"
   site_directory="$DEPLOY_ROOT/$slug"
   service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
@@ -431,6 +799,7 @@ prepare_site() {
   user_home="$(printf '%s' "$user_entry" | cut -d: -f6)"
   user_group="$(id -gn "$run_user")"
   [ "$user_home" = "$service_home" ] && [ "$user_group" = "vidkar-commerce" ] || fail "Existing commerce service account has unexpected ownership."
+  record_service_uid "$request_id" "$slug" "$run_user"
   chmod 0700 "$service_home"
   install -d -o "$run_user" -g vidkar-commerce -m 0700 "$site_directory"
 
@@ -459,7 +828,6 @@ WantedBy=multi-user.target
 EOF
   chmod 0600 "$temporary_unit"
   mv "$temporary_unit" "$service_unit"
-  trap - EXIT HUP INT TERM
   systemctl daemon-reload
 }
 
@@ -580,24 +948,63 @@ run_pm2_operation() {
   slug=$2
   request_id=$3
   run_user=$4
-  if [ "$operation" = "delete" ] && ! getent passwd "$run_user" >/dev/null; then
-    service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
-    site_directory="$DEPLOY_ROOT/$slug"
-    if [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] && [ ! -e "$site_directory" ] && [ ! -L "$site_directory" ]; then
-      return 0
-    fi
-    fail "Cannot stop PM2 because the registered service account is missing while site resources remain."
-  fi
-  directory="$(service_directory "$slug" "$request_id" "$run_user")"
-  pm2_binary="$(trusted_binary pm2)"
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_service_user "$slug" "$run_user"
   request_short="$(printf '%s' "$request_id" | cut -c1-12)"
   app_name="vidkar-comercio-$slug-$request_short"
+
   case "$operation" in
-    start) run_as_commerce "$run_user" "$directory" "$pm2_binary" start ecosystem.config.cjs --only "$app_name" ;;
-    save) run_as_commerce "$run_user" "$directory" "$pm2_binary" save ;;
+    start|save)
+      directory="$(service_directory "$slug" "$request_id" "$run_user")"
+      pm2_binary="$(trusted_binary pm2)"
+      if [ "$operation" = "start" ]; then
+        run_as_commerce "$run_user" "$directory" "$pm2_binary" start ecosystem.config.cjs --only "$app_name"
+      else
+        run_as_commerce "$run_user" "$directory" "$pm2_binary" save
+      fi
+      ;;
     delete)
-      run_as_commerce "$run_user" "$directory" "$pm2_binary" delete "$app_name" >/dev/null 2>&1 || true
-      run_as_commerce "$run_user" "$directory" "$pm2_binary" save
+      validate_deploy_root
+      service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+      site_directory="$DEPLOY_ROOT/$slug"
+      hostname="$slug.vidkar.com"
+      config_file="/etc/nginx/sites-available/$hostname.conf"
+      enabled_link="/etc/nginx/sites-enabled/$hostname.conf"
+      service_home="/var/lib/vidkar-commerce/$slug"
+      service_account_entry="$(getent passwd "$run_user" || true)"
+      if [ -z "$service_account_entry" ]; then
+        if [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] \
+          && [ ! -e "$site_directory" ] && [ ! -L "$site_directory" ] \
+          && [ ! -e "$config_file" ] && [ ! -L "$config_file" ] \
+          && [ ! -e "$enabled_link" ] && [ ! -L "$enabled_link" ] \
+          && [ ! -e "$service_home" ] && [ ! -L "$service_home" ]; then
+          return 0
+        fi
+        require_request "$request_id" "$slug" "$run_user"
+        if [ -e "$service_unit" ] || [ -L "$service_unit" ] \
+          || [ -e "$site_directory" ] || [ -L "$site_directory" ] \
+          || [ -e "$config_file" ] || [ -L "$config_file" ] \
+          || [ -e "$enabled_link" ] || [ -L "$enabled_link" ]; then
+          fail "Cannot retry PM2 cleanup while site or NGINX resources remain without the service account."
+        fi
+        if [ -e "$service_home" ] || [ -L "$service_home" ]; then
+          recorded_service_uid="$(sed -n '3p' "$HELPER_STATE_DIR/$request_id")"
+          validate_orphaned_service_home "$recorded_service_uid" "$service_home"
+          return 0
+        fi
+        fail "Cannot stop PM2 because the registered service account is missing while site resources remain."
+      fi
+      require_request "$request_id" "$slug" "$run_user"
+      [ "$(printf '%s' "$service_account_entry" | cut -d: -f6)" = "$service_home" ] \
+        || fail "Cannot stop PM2 because the service home does not match this store."
+      validate_service_home_parent
+      [ ! -L "$service_home" ] && [ -d "$service_home" ] \
+        && [ "$(stat -c '%U' "$service_home")" = "$run_user" ] \
+        || fail "Commerce service home is not owned by this store account."
+      pm2_binary="$(trusted_binary pm2)"
+      run_as_commerce "$run_user" "$service_home" "$pm2_binary" delete "$app_name" >/dev/null 2>&1 || true
+      run_as_commerce "$run_user" "$service_home" "$pm2_binary" save
       ;;
     *) fail "Unsupported PM2 operation." ;;
   esac
@@ -703,6 +1110,7 @@ issue_certificate() {
   valid_port "$port" || fail "Application port is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
   validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
+  validate_nginx_directories "$available_dir" "$enabled_dir"
   validate_service_user "$slug" "$run_user"
   case "$email" in *' '*|*';'*|*'`'*|*'$'*|*@*.*) ;; *) fail "Certbot email is invalid." ;; esac
 
@@ -712,7 +1120,35 @@ issue_certificate() {
   [ -f "$config_file" ] && grep -Fqx "$marker" "$config_file" || fail "The HTTP challenge site is not managed by this request."
   require_request "$request_id" "$slug" "$run_user"
   check_dns "$hostname" "$expected_ipv4"
-  certbot certonly --webroot --webroot-path "$acme_webroot" --domain "$hostname" --email "$email" --agree-tos --non-interactive --no-eff-email --keep-until-expiring
+  certificate_name="$(certificate_name_for_request "$slug" "$request_id")"
+  certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
+  if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+    [ -f "$certificate_marker" ] && [ ! -L "$certificate_marker" ] || fail "Certificate ownership marker is not a regular file."
+    [ "$(sed -n '1p' "$certificate_marker")" = "$slug" ] \
+      && [ "$(sed -n '2p' "$certificate_marker")" = "$hostname" ] \
+      && [ "$(sed -n '3p' "$certificate_marker")" = "$certificate_name" ] \
+      || fail "Certificate ownership marker does not match this request."
+  else
+    if [ -e "/etc/letsencrypt/renewal/$certificate_name.conf" ] \
+      || [ -L "/etc/letsencrypt/renewal/$certificate_name.conf" ] \
+      || [ -e "/etc/letsencrypt/live/$certificate_name" ] \
+      || [ -L "/etc/letsencrypt/live/$certificate_name" ]; then
+      fail "A certificate lineage already exists without a matching request marker; manual review is required."
+    fi
+    temporary_certificate_marker="$(mktemp "$HELPER_STATE_DIR/.certificate.XXXXXX")"
+    printf '%s\n%s\n%s\n' "$slug" "$hostname" "$certificate_name" > "$temporary_certificate_marker"
+    chown root:root "$temporary_certificate_marker"
+    chmod 0600 "$temporary_certificate_marker"
+    mv "$temporary_certificate_marker" "$certificate_marker"
+  fi
+
+  certbot certonly --webroot --webroot-path "$acme_webroot" --domain "$hostname" \
+    --cert-name "$certificate_name" --email "$email" --agree-tos --non-interactive \
+    --no-eff-email --keep-until-expiring
+  certificate_file="/etc/letsencrypt/live/$certificate_name/cert.pem"
+  [ -s "$certificate_file" ] || fail "The request-owned certificate was not created."
+  certificate_has_only_hostname "$certificate_file" "$hostname" \
+    || fail "The certificate lineage contains domains outside this store."
 }
 
 [ "${1:-}" = "--signature" ] && [ "$#" -ge 3 ] || fail "An operation signature is required."
@@ -767,6 +1203,10 @@ case "$command" in
   remove-nginx)
     [ "$#" -eq 6 ] || fail "Usage: remove-nginx <slug> <request-id> <available-dir> <enabled-dir> <acme-webroot> <service-user>"
     remove_nginx "$@"
+    ;;
+  remove-certificate)
+    [ "$#" -eq 6 ] || fail "Usage: remove-certificate <slug> <request-id> <available-dir> <enabled-dir> <service-user> <allow-legacy>"
+    remove_certificate "$@"
     ;;
   remove-site)
     [ "$#" -eq 3 ] || fail "Usage: remove-site <slug> <request-id> <service-user>"
