@@ -445,6 +445,7 @@ const startWorker = ({
 
       const result = await close({
         assertLease,
+        closeSteps: task.closeSteps,
         config,
         journal,
         logger: taskLogger,

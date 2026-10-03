@@ -236,6 +236,67 @@ test("el cierre elimina solo recursos ligados al journal y conserva certificados
   assert.equal(journalWrites.at(-1).closeWarnings.length, 1);
 });
 
+test("el reintento de cierre omite pasos completados y repite solo certificado y sitio", async () => {
+  const calls = [];
+  const reports = [];
+  const request = {
+    closeSteps: [
+      { id: "stop_pm2", status: "COMPLETADO" },
+      { id: "remove_nginx", status: "COMPLETADO" },
+      { id: "remove_certificate", status: "FALLIDO" },
+      { id: "remove_site", status: "FALLIDO" },
+    ],
+    hostname: "mercado-norte.vidkar.com",
+    requestId: "request-close-retry",
+    slug: "mercado-norte",
+  };
+  const result = await closeDeployment({
+    closeSteps: request.closeSteps,
+    config: {
+      acmeWebroot: "/var/www/letsencrypt",
+      commandTimeoutMs: 5000,
+      deployRoot: "/opt/vidkar/comercios",
+      helperHmacSecret: "helper-secret-" + "h".repeat(48),
+      nginxSitesAvailable: "/etc/nginx/sites-available",
+      nginxSitesEnabled: "/etc/nginx/sites-enabled",
+      portRangeEnd: 5899,
+      portRangeStart: 5200,
+      privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+    },
+    journal: {
+      certificateName: certificateNameForRequest(request.slug, request.requestId),
+      hostname: request.hostname,
+      nginxAvailablePath: `/etc/nginx/sites-available/${request.hostname}.conf`,
+      nginxEnabledPath: `/etc/nginx/sites-enabled/${request.hostname}.conf`,
+      pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
+      port: 5210,
+      requestId: request.requestId,
+      runUser: createServiceUsername(request.slug),
+      siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
+      siteDirectoryCreated: true,
+      slug: request.slug,
+      state: "CLOSE_FAILED",
+    },
+    logger: { error() {}, info() {}, warn() {} },
+    onCloseStep: async (...report) => reports.push(report),
+    portProbe: async () => { assert.fail("no debe repetir PM2 ya completado"); },
+    request,
+    runner: {
+      runCommand: async (_command, args) => {
+        calls.push(args);
+        return { stdoutTail: "" };
+      },
+    },
+    stateStore: { write: async () => {} },
+  });
+
+  assert.equal(result.closeSucceeded, true);
+  assert.deepEqual(calls.map((args) => args[4]), ["remove-certificate", "remove-site"]);
+  assert.deepEqual(reports.filter(([, outcome]) => outcome === "STARTED").map(([stepId]) => stepId), [
+    "remove_certificate", "remove_site",
+  ]);
+});
+
 test("el cierre bloquea Nginx, certificado y archivos si PM2 no libera el puerto", async () => {
   const calls = [];
   const reports = [];

@@ -43,6 +43,7 @@ const validateCloseTarget = ({ config, journal, request }) => {
 const closeDeployment = async ({
   assertLease = () => {},
   config,
+  closeSteps = [],
   journal,
   logger = console,
   onCloseStep = async () => {},
@@ -54,6 +55,13 @@ const closeDeployment = async ({
   validateCloseTarget({ config, journal, request });
   const errors = [];
   const warnings = [];
+  const previousSteps = new Map((Array.isArray(closeSteps) ? closeSteps : []).map((step) => [step.id, step]));
+  const previousCertificateStep = previousSteps.get("remove_certificate");
+  const certificatePreviouslyPreserved = previousCertificateStep?.status === "COMPLETADO"
+    && /Certbot conservó/u.test(previousCertificateStep.message || "");
+  if (certificatePreviouslyPreserved) {
+    warnings.push("Certbot conservó un certificado compartido, legacy sin propiedad verificable, referenciado por otro servicio o no verificable.");
+  }
   const privilegedHelper = createPrivilegedHelperRunner({ config, runner });
   const labels = {
     stop_pm2: "Detener PM2",
@@ -62,8 +70,19 @@ const closeDeployment = async ({
     remove_site: "Eliminar archivos y cuenta de servicio",
   };
 
-  const runStep = async (stepId, action, formatSuccess = () => `${labels[stepId]}: completado.`) => {
+  const runStep = async (
+    stepId,
+    action,
+    formatSuccess = () => `${labels[stepId]}: completado.`,
+    onAlreadyCompleted = () => null,
+  ) => {
     const label = labels[stepId];
+    const previousStep = previousSteps.get(stepId);
+    if (previousStep?.status === "COMPLETADO") {
+      assertLease();
+      logger.info?.(`CLOSE SKIP step=${stepId} reason=already_completed`);
+      return { result: onAlreadyCompleted(previousStep), succeeded: true, skipped: true };
+    }
     const startedAt = Date.now();
     assertLease();
     logger.info?.(`CLOSE START step=${stepId}`);
@@ -138,7 +157,8 @@ const closeDeployment = async ({
     return { preservedCertificate };
   }, (result) => result?.preservedCertificate
     ? "Certbot conservó un certificado compartido, legacy sin propiedad verificable o referenciado por otro servicio."
-    : "Se retiró el certificado exclusivo de este dominio, o no había uno que retirar.");
+    : "Se retiró el certificado exclusivo de este dominio, o no había uno que retirar.",
+  () => ({ preservedCertificate: certificatePreviouslyPreserved }));
 
   await runStep("remove_site", async () => {
     if (!pm2Stopped.succeeded || !nginxRemoved.succeeded || !certificateRemoved.succeeded) {
