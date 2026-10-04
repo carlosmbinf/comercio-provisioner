@@ -497,7 +497,7 @@ remove_certificate() {
   validate_service_user "$slug" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "/var/www/letsencrypt"
   validate_nginx_directories "$available_dir" "$enabled_dir"
-  case "$allow_legacy" in 0|1) ;; *) fail "Legacy certificate cleanup flag is invalid." ;; esac
+  case "$allow_legacy" in 0|1|2) ;; *) fail "Legacy certificate cleanup flag is invalid." ;; esac
 
   hostname="$slug.vidkar.com"
   config_file="$available_dir/$hostname.conf"
@@ -528,6 +528,8 @@ remove_certificate() {
   elif [ "$allow_legacy" = "1" ]; then
     printf '%s\n' "CERTIFICATE_PRESERVED_UNOWNED"
     return 0
+  elif [ "$allow_legacy" = "2" ]; then
+    owned_certificate_name=$hostname
   else
     return 0
   fi

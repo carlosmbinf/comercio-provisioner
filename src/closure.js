@@ -147,7 +147,7 @@ const closeDeployment = async ({
       config.nginxSitesAvailable,
       config.nginxSitesEnabled,
       journal.runUser,
-      "1",
+      "2",
     ], { timeoutMs: config.commandTimeoutMs });
     const preservedCertificate = (result?.stdoutTail || "").split(/\r?\n/u)
       .some((line) => /^CERTIFICATE_PRESERVED(?:_[A-Z_]+)?$/u.test(line));

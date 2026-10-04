@@ -229,6 +229,7 @@ test("el cierre elimina solo recursos ligados al journal y conserva certificados
   assert.equal(result.warnings.length, 1);
   assert.deepEqual(calls.map((args) => args[4]), ["pm2-delete", "remove-nginx", "remove-certificate", "remove-site"]);
   assert.ok(calls.every((args) => args[5] === request.slug && args[6] === request.requestId));
+  assert.equal(calls.find((args) => args[4] === "remove-certificate").at(-1), "2");
   assert.deepEqual(reports.filter(([, outcome]) => outcome === "COMPLETED").map(([stepId]) => stepId), [
     "stop_pm2", "remove_nginx", "remove_certificate", "remove_site",
   ]);
@@ -295,6 +296,57 @@ test("el reintento de cierre omite pasos completados y repite solo certificado y
   assert.deepEqual(reports.filter(([, outcome]) => outcome === "STARTED").map(([stepId]) => stepId), [
     "remove_certificate", "remove_site",
   ]);
+});
+
+test("un cierre reanudado conserva la advertencia de un certificado ya preservado", async () => {
+  const calls = [];
+  const request = {
+    closeSteps: [
+      { id: "stop_pm2", status: "COMPLETADO" },
+      { id: "remove_nginx", status: "COMPLETADO" },
+      { id: "remove_certificate", status: "COMPLETADO", message: "Certbot conservó un certificado compartido." },
+      { id: "remove_site", status: "FALLIDO" },
+    ],
+    hostname: "mercado-norte.vidkar.com",
+    requestId: "request-close-preserved-cert",
+    slug: "mercado-norte",
+  };
+  const result = await closeDeployment({
+    closeSteps: request.closeSteps,
+    config: {
+      commandTimeoutMs: 5000,
+      deployRoot: "/opt/vidkar/comercios",
+      helperHmacSecret: "helper-secret-" + "h".repeat(48),
+      nginxSitesAvailable: "/etc/nginx/sites-available",
+      nginxSitesEnabled: "/etc/nginx/sites-enabled",
+      portRangeEnd: 5899,
+      portRangeStart: 5200,
+      privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+    },
+    journal: {
+      certificateName: certificateNameForRequest(request.slug, request.requestId),
+      hostname: request.hostname,
+      nginxAvailablePath: `/etc/nginx/sites-available/${request.hostname}.conf`,
+      nginxEnabledPath: `/etc/nginx/sites-enabled/${request.hostname}.conf`,
+      pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
+      port: 5213,
+      requestId: request.requestId,
+      runUser: createServiceUsername(request.slug),
+      siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
+      siteDirectoryCreated: true,
+      slug: request.slug,
+      state: "CLOSE_FAILED",
+    },
+    logger: { error() {}, info() {}, warn() {} },
+    onCloseStep: async () => {},
+    request,
+    runner: { runCommand: async (_command, args) => { calls.push(args); return {}; } },
+    stateStore: { write: async () => {} },
+  });
+
+  assert.equal(result.closeSucceeded, true);
+  assert.equal(result.warnings.length, 1);
+  assert.deepEqual(calls.map((args) => args[4]), ["remove-site"]);
 });
 
 test("el cierre bloquea Nginx, certificado y archivos si PM2 no libera el puerto", async () => {
@@ -493,6 +545,8 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   assert.match(helper, /certbot delete --cert-name "\$certificate_name" --non-interactive/);
   assert.match(helper, /CERTIFICATE_PRESERVED_SHARED_SAN/);
   assert.match(helper, /CERTIFICATE_PRESERVED_IN_USE/);
+  assert.match(helper, /case "\$allow_legacy" in 0\|1\|2/);
+  assert.match(helper, /elif \[ "\$allow_legacy" = "2" \]; then\s+owned_certificate_name=\$hostname/);
   assert.doesNotMatch(helper, /rm -rf[^\n]*\/etc\/letsencrypt/);
 
   const removeNginxFunction = helper.match(/remove_nginx\(\) \{([\s\S]*?)\n\}/)?.[1];
