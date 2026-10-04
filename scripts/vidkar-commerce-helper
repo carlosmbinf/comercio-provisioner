@@ -754,6 +754,10 @@ remove_site() {
     rm -rf -- "$site_directory"
   fi
   if [ "$service_account_exists" -eq 1 ]; then
+    if [ -d "$service_home" ]; then
+      pm2_binary="$(trusted_binary pm2)"
+      stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
+    fi
     userdel --remove "$run_user"
     if getent passwd "$run_user" >/dev/null; then
       fail "The commerce service account remains after userdel; manual review is required."
@@ -936,6 +940,13 @@ run_as_commerce() {
     "$environment_binary" "--chdir=$site_directory" "$@"
 }
 
+stop_pm2_daemon() {
+  run_user=$1
+  service_home=$2
+  pm2_binary=$3
+  run_as_commerce "$run_user" "$service_home" "$pm2_binary" kill
+}
+
 run_npm_install() {
   slug=$1
   request_id=$2
@@ -1007,6 +1018,7 @@ run_pm2_operation() {
       pm2_binary="$(trusted_binary pm2)"
       run_as_commerce "$run_user" "$service_home" "$pm2_binary" delete "$app_name" >/dev/null 2>&1 || true
       run_as_commerce "$run_user" "$service_home" "$pm2_binary" save
+      stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
       ;;
     *) fail "Unsupported PM2 operation." ;;
   esac

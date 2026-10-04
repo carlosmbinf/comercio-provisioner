@@ -539,6 +539,8 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   assert.match(helper, /validate_deploy_root\(\)/);
   assert.match(helper, /validate_directory_not_group_writable/);
   assert.match(helper, /run_as_commerce "\$run_user" "\$service_home" "\$pm2_binary" delete/);
+  assert.match(helper, /stop_pm2_daemon\(\) \{/);
+  assert.match(helper, /run_as_commerce "\$run_user" "\$service_home" "\$pm2_binary" kill/);
   assert.match(helper, /record_service_uid\(\)/);
   assert.match(helper, /validate_orphaned_service_home\(\)/);
   assert.match(helper, /getent passwd "\$orphan_uid"/);
@@ -548,6 +550,15 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   assert.match(helper, /case "\$allow_legacy" in 0\|1\|2/);
   assert.match(helper, /elif \[ "\$allow_legacy" = "2" \]; then\s+owned_certificate_name=\$hostname/);
   assert.doesNotMatch(helper, /rm -rf[^\n]*\/etc\/letsencrypt/);
+
+  const removeSiteFunction = helper.match(/remove_site\(\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(removeSiteFunction, "debe encontrar la función que retira la tienda");
+  const pm2StopPosition = removeSiteFunction.indexOf('stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"');
+  const userDeletePosition = removeSiteFunction.indexOf('userdel --remove "$run_user"');
+  assert.ok(
+    pm2StopPosition >= 0 && userDeletePosition > pm2StopPosition,
+    "debe cerrar el daemon PM2 de la tienda antes de eliminar su cuenta",
+  );
 
   const removeNginxFunction = helper.match(/remove_nginx\(\) \{([\s\S]*?)\n\}/)?.[1];
   const unregisteredBranch = removeNginxFunction?.match(/if \[ ! -f "\$permit_file" \]; then([\s\S]*?)\n  fi/)?.[1];
