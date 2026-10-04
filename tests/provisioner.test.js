@@ -15,7 +15,7 @@ const {
   findAvailablePort,
   serializeCommerceEnv,
 } = require("../src/deployment");
-const { closeDeployment } = require("../src/closure");
+const { closeDeployment, isRetryableCloseFailure } = require("../src/closure");
 const { dnsPointsToVps, resolveA } = require("../src/dns");
 const { renderHttpNginxConfig, renderHttpsNginxConfig } = require("../src/nginxConfig");
 const { createPrivilegedHelperRunner, signOperation } = require("../src/privilegedHelper");
@@ -390,10 +390,26 @@ test("el cierre bloquea Nginx, certificado y archivos si PM2 no libera el puerto
   });
 
   assert.equal(result.closeSucceeded, false);
+  assert.equal(result.retryable, true);
   assert.deepEqual(calls.map((args) => args[4]), ["pm2-delete"]);
   assert.deepEqual(reports.filter(([, outcome]) => outcome === "FAILED").map(([stepId]) => stepId), [
     "stop_pm2", "remove_nginx", "remove_certificate", "remove_site",
   ]);
+});
+
+test("solo reintenta automáticamente fallos operativos identificados", () => {
+  assert.equal(isRetryableCloseFailure(Object.assign(new Error("operational"), {
+    commandFailure: { command: "sudo", exitCode: 75, stderr: "AUTO_RETRY: transient failure" },
+  })), true);
+  assert.equal(isRetryableCloseFailure(Object.assign(new Error("user busy"), {
+    commandFailure: { command: "sudo", exitCode: 8, stderr: "userdel: user vcommerce-test is currently used by process 123" },
+  })), true);
+  assert.equal(isRetryableCloseFailure(Object.assign(new Error("ownership mismatch"), {
+    commandFailure: { command: "sudo", exitCode: 1, stderr: "Service home has unexpected ownership." },
+  })), false);
+  assert.equal(isRetryableCloseFailure(Object.assign(new Error("journal mismatch"), {
+    code: "CLOSE_BLOCKED",
+  })), false);
 });
 
 test("rechaza un journal que apunta a otra tienda antes de invocar el helper root", async () => {
@@ -541,6 +557,8 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   assert.match(helper, /run_as_commerce "\$run_user" "\$service_home" "\$pm2_binary" delete/);
   assert.match(helper, /stop_pm2_daemon\(\) \{/);
   assert.match(helper, /run_as_commerce "\$run_user" "\$service_home" "\$pm2_binary" kill/);
+  assert.match(helper, /fail_retryable\(\) \{[\s\S]*?exit 75/);
+  assert.match(helper, /while \[ "\$delete_attempt" -le 3 \]/);
   assert.match(helper, /record_service_uid\(\)/);
   assert.match(helper, /validate_orphaned_service_home\(\)/);
   assert.match(helper, /getent passwd "\$orphan_uid"/);
@@ -553,12 +571,16 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
 
   const removeSiteFunction = helper.match(/remove_site\(\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(removeSiteFunction, "debe encontrar la función que retira la tienda");
-  const pm2StopPosition = removeSiteFunction.indexOf('stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"');
-  const userDeletePosition = removeSiteFunction.indexOf('userdel --remove "$run_user"');
+  assert.match(removeSiteFunction, /remove_service_account "\$run_user" "\$service_home" "\$pm2_binary"/);
+  const removeServiceAccountFunction = helper.match(/remove_service_account\(\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(removeServiceAccountFunction, "debe encontrar el reintento de eliminación de la cuenta");
+  const pm2StopPosition = removeServiceAccountFunction.indexOf('stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"');
+  const userDeletePosition = removeServiceAccountFunction.indexOf('userdel --remove "$run_user"');
   assert.ok(
     pm2StopPosition >= 0 && userDeletePosition > pm2StopPosition,
-    "debe cerrar el daemon PM2 de la tienda antes de eliminar su cuenta",
+    "debe cerrar el daemon PM2 antes de intentar tres veces eliminar la cuenta",
   );
+  assert.match(removeServiceAccountFunction, /fail_retryable "The commerce service account is still in use/);
 
   const removeNginxFunction = helper.match(/remove_nginx\(\) \{([\s\S]*?)\n\}/)?.[1];
   const unregisteredBranch = removeNginxFunction?.match(/if \[ ! -f "\$permit_file" \]; then([\s\S]*?)\n  fi/)?.[1];

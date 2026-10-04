@@ -8,6 +8,20 @@ const { sleep } = require("./taskLock");
 const shouldFinishRecoveredDeployment = (task, journal) => !task.rollbackOnly
   && (journal.state === "ACTIVE" || journal.completedSteps?.includes("verify_site"));
 const CLOSE_STEP_IDS = ["stop_pm2", "remove_nginx", "remove_certificate", "remove_site"];
+const CLOSE_RETRY_DELAYS_MS = [3000, 10000];
+
+const runCloseWithAutomaticRetries = async ({ run, logger = console, wait = sleep }) => {
+  let result;
+  for (let attempt = 1; attempt <= CLOSE_RETRY_DELAYS_MS.length + 1; attempt += 1) {
+    result = await run(attempt);
+    if (result.closeSucceeded || result.retryable !== true || attempt === CLOSE_RETRY_DELAYS_MS.length + 1) {
+      return result;
+    }
+    logger.warn?.(`CLOSE RETRY intento=${attempt + 1}/${CLOSE_RETRY_DELAYS_MS.length + 1} fallo_operativo=true`);
+    await wait(CLOSE_RETRY_DELAYS_MS[attempt - 1]);
+  }
+  return result;
+};
 
 const confirmFinishOrDefer = async ({ finish, logger = console, onUnconfirmed = () => {}, wait = sleep }) => {
   const finishConfirmed = async () => {
@@ -396,14 +410,18 @@ const startWorker = ({
     setActiveTask(task);
     let lock;
     const fencedClient = createFencedClient({ assertLease, client, config, onLeaseLost: markLeaseLost, task });
-    const finishClose = (success, message = "") => fencedClient.call(
+    const finishClose = (success, message = "", automaticRetry = false) => fencedClient.call(
       "comercio.provisioning.worker.finishClose",
       config.token,
       config.workerId,
       task.requestId,
       success,
       message,
+      automaticRetry,
     );
+    const localCloseSteps = Array.isArray(task.closeSteps)
+      ? task.closeSteps.map((step) => ({ ...step }))
+      : [];
 
     try {
       lock = await acquireTaskLock(task.requestId);
@@ -443,13 +461,8 @@ const startWorker = ({
         return;
       }
 
-      const result = await close({
-        assertLease,
-        closeSteps: task.closeSteps,
-        config,
-        journal,
-        logger: taskLogger,
-        onCloseStep: (stepId, outcome, message) => fencedClient.call(
+      const reportCloseStep = async (stepId, outcome, message) => {
+        const response = await fencedClient.call(
           "comercio.provisioning.worker.reportCloseStep",
           config.token,
           config.workerId,
@@ -457,13 +470,50 @@ const startWorker = ({
           stepId,
           outcome,
           message,
-        ),
-        request: task,
-        runner: taskRunner,
-        stateStore,
+        );
+        const status = outcome === "STARTED" ? "EN_PROGRESO" : outcome === "COMPLETED" ? "COMPLETADO" : "FALLIDO";
+        let current = localCloseSteps.find((step) => step.id === stepId);
+        if (!current) {
+          current = { id: stepId, status };
+          localCloseSteps.push(current);
+        }
+        current.status = status;
+        if (message) current.message = message;
+        if (outcome === "STARTED") delete current.completedAt;
+        else current.completedAt = new Date();
+        return response;
+      };
+      const result = await runCloseWithAutomaticRetries({
+        logger: taskLogger,
+        run: () => close({
+          assertLease,
+          closeSteps: localCloseSteps,
+          config,
+          journal,
+          logger: taskLogger,
+          onCloseStep: reportCloseStep,
+          request: task,
+          runner: taskRunner,
+          stateStore,
+        }),
       });
 
       if (!result.closeSucceeded) {
+        if (result.retryable) {
+          const message = result.errors.join(" ") || "El cierre encontró un fallo operativo y se reintentará automáticamente.";
+          try {
+            const finishResult = await finishClose(false, message, true);
+            if (finishResult?.status === "CERRANDO") {
+              taskLogger.warn("CLOSE AUTO_RETRY_SCHEDULED el sistema volverá a intentar el cierre; no requiere intervención manual");
+              return;
+            }
+          } catch (_scheduleError) {
+            taskLogger.warn("CLOSE AUTO_RETRY_UNCONFIRMED el lease permitirá recuperar el cierre automáticamente");
+            return;
+          }
+          taskLogger.warn("CLOSE AUTO_RETRY_UNCONFIRMED el lease permitirá recuperar el cierre automáticamente");
+          return;
+        }
         const finishResult = await finishClose(false, result.errors.join(" "));
         if (finishResult?.status !== "CIERRE_FALLIDO") {
           throw new Error("VIDKAR no confirmó que el cierre requiere revisión manual.");
@@ -494,11 +544,25 @@ const startWorker = ({
         return;
       }
       const message = sanitizeMessage(error?.message || "Falló el cierre de la tienda.");
-      taskLogger.error(`CLOSE FAIL reason=${message}; requiere revisión`);
+      if (error?.code !== "CLOSE_BLOCKED") {
+        try {
+          const finishResult = await finishClose(false, message, true);
+          if (finishResult?.status === "CERRANDO") {
+            taskLogger.warn("CLOSE AUTO_RETRY_SCHEDULED el fallo operativo se reintentará automáticamente");
+            return;
+          }
+        } catch (_scheduleError) {
+          taskLogger.warn("CLOSE AUTO_RETRY_UNCONFIRMED el lease permitirá recuperar el cierre automáticamente");
+          return;
+        }
+        taskLogger.warn("CLOSE AUTO_RETRY_UNCONFIRMED el lease permitirá recuperar el cierre automáticamente");
+        return;
+      }
+      taskLogger.error(`CLOSE BLOCKED reason=${message}; requiere revisar propiedad o seguridad`);
       try {
         const finishResult = await finishClose(false, message);
         if (finishResult?.status !== "CIERRE_FALLIDO") {
-          taskLogger.warn("CLOSE REPORT_FAILED VIDKAR no confirmó el estado de revisión; el lease permitirá recuperar la tarea");
+          taskLogger.warn("CLOSE REPORT_FAILED VIDKAR no confirmó el bloqueo; el lease permitirá recuperar el cierre");
         }
       } catch (_reportError) {
         taskLogger.warn("CLOSE REPORT_FAILED el lease vigente permitirá recuperar la tarea");
@@ -535,6 +599,7 @@ const startWorker = ({
         config.token,
         config.workerId,
         config.publicIpv4,
+        true,
       );
       rootLogger.info("WORKER registrado; esperando tareas con DNS verificado");
 
@@ -570,4 +635,11 @@ const startWorker = ({
   };
 };
 
-module.exports = { confirmCloseOrDefer, confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment, startWorker };
+module.exports = {
+  confirmCloseOrDefer,
+  confirmFinishOrDefer,
+  createFencedClient,
+  runCloseWithAutomaticRetries,
+  shouldFinishRecoveredDeployment,
+  startWorker,
+};

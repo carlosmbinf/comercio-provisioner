@@ -13,6 +13,11 @@ fail() {
   exit 1
 }
 
+fail_retryable() {
+  printf 'AUTO_RETRY: %s\n' "$1" >&2
+  exit 75
+}
+
 verify_signature() {
   signature=$1
   shift
@@ -456,11 +461,10 @@ remove_nginx() {
     [ -f "$service_unit" ] && [ ! -L "$service_unit" ] || fail "Refusing to remove an unexpected systemd unit path."
     grep -Fqx "# Managed by VIDKAR commerce provisioner; request $request_id" "$service_unit" || fail "Refusing to remove a systemd unit not owned by this request."
     if systemctl is-active --quiet "vidkar-commerce-$slug.service"; then
-      systemctl stop "vidkar-commerce-$slug.service" || fail "Could not stop this store's systemd unit."
+      systemctl stop "vidkar-commerce-$slug.service" || fail_retryable "Could not stop this store's systemd unit."
     fi
-    systemctl disable "vidkar-commerce-$slug.service" >/dev/null 2>&1 || true
-    rm -f "$service_unit"
-    systemctl daemon-reload
+    systemctl disable "vidkar-commerce-$slug.service" >/dev/null 2>&1 || fail_retryable "Could not disable this store's systemd unit."
+    rm -f "$service_unit" || fail_retryable "Could not remove this store's systemd unit."
   fi
 
   if [ -e "$enabled_link" ] || [ -L "$enabled_link" ]; then
@@ -471,18 +475,19 @@ remove_nginx() {
       [ -f "$config_file" ] && [ ! -L "$config_file" ] || fail "Refusing to remove an unexpected NGINX configuration path."
       grep -Fqx "$marker" "$config_file" || fail "Refusing to remove an NGINX link whose configuration is not owned by this request."
     fi
-    rm -f "$enabled_link"
+    rm -f "$enabled_link" || fail_retryable "Could not remove this store's NGINX link."
   fi
 
   if [ -e "$config_file" ] || [ -L "$config_file" ]; then
     [ -f "$config_file" ] && [ ! -L "$config_file" ] || fail "Refusing to remove an unexpected NGINX configuration path."
     grep -Fqx "$marker" "$config_file" || fail "Refusing to remove a configuration not owned by this request."
-    rm -f "$config_file"
+    rm -f "$config_file" || fail_retryable "Could not remove this store's NGINX configuration."
   fi
 
   # Always reconcile the active NGINX config, including a retry after file removal succeeded but reload failed.
-  nginx -t
-  systemctl reload nginx
+  systemctl daemon-reload || fail_retryable "Could not reload the systemd unit registry."
+  nginx -t || fail_retryable "NGINX configuration validation failed after removing this store."
+  systemctl reload nginx || fail_retryable "Could not reload NGINX after removing this store."
 }
 
 remove_certificate() {
@@ -633,7 +638,7 @@ remove_certificate() {
     fi
 
     certbot delete --cert-name "$certificate_name" --non-interactive \
-      || fail "Certbot could not remove an exclusive certificate lineage."
+      || fail_retryable "Certbot could not remove an exclusive certificate lineage."
     [ ! -e "$renewal_config" ] && [ ! -L "$renewal_config" ] \
       || fail "Certbot did not remove the requested certificate lineage."
     [ ! -e "$certificate_live_root" ] && [ ! -L "$certificate_live_root" ] \
@@ -651,7 +656,7 @@ remove_certificate() {
     fi
   fi
   if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
-    rm -f "$certificate_marker"
+    rm -f "$certificate_marker" || fail_retryable "Could not remove the completed certificate ownership record."
   fi
 }
 
@@ -680,7 +685,7 @@ remove_site() {
       fail "Certificate ownership remains without a root-owned request registration; manual review is required."
     fi
     if [ "$(cat "$domain_file" 2>/dev/null || true)" = "$request_id" ]; then
-      rm -f "$domain_file"
+      rm -f "$domain_file" || fail_retryable "Could not remove the completed domain ownership record."
     fi
     return 0
   fi
@@ -748,30 +753,27 @@ remove_site() {
   fi
 
   if [ "$checkout_exists" -eq 1 ]; then
-    rm -rf -- "$checkout_directory"
+    rm -rf -- "$checkout_directory" || fail_retryable "Could not remove the worker checkout for this store."
   fi
   if [ "$site_exists" -eq 1 ]; then
-    rm -rf -- "$site_directory"
+    rm -rf -- "$site_directory" || fail_retryable "Could not remove this store's site directory."
   fi
   if [ "$service_account_exists" -eq 1 ]; then
-    if [ -d "$service_home" ]; then
-      pm2_binary="$(trusted_binary pm2)"
-      stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
-    fi
-    userdel --remove "$run_user"
+    pm2_binary="$(trusted_binary pm2)"
+    remove_service_account "$run_user" "$service_home" "$pm2_binary"
     if getent passwd "$run_user" >/dev/null; then
-      fail "The commerce service account remains after userdel; manual review is required."
+      fail_retryable "The commerce service account remains after userdel."
     fi
     if [ -e "$service_home" ] || [ -L "$service_home" ]; then
       recorded_service_uid="$(sed -n '3p' "$permit_file")"
       validate_orphaned_service_home "$recorded_service_uid" "$service_home"
-      rm -rf -- "$service_home"
+      rm -rf -- "$service_home" || fail_retryable "Could not remove the isolated home directory for this store."
     fi
   elif [ "$orphaned_service_home" -eq 1 ]; then
-    rm -rf -- "$service_home"
+    rm -rf -- "$service_home" || fail_retryable "Could not remove the isolated home directory for this store."
   fi
-  rm -f "$permit_file"
-  [ "$(cat "$domain_file" 2>/dev/null || true)" != "$request_id" ] || rm -f "$domain_file"
+  rm -f "$permit_file" || fail_retryable "Could not remove the completed request ownership record."
+  [ "$(cat "$domain_file" 2>/dev/null || true)" != "$request_id" ] || rm -f "$domain_file" || fail_retryable "Could not remove the completed domain ownership record."
 }
 
 prepare_site() {
@@ -944,7 +946,34 @@ stop_pm2_daemon() {
   run_user=$1
   service_home=$2
   pm2_binary=$3
-  run_as_commerce "$run_user" "$service_home" "$pm2_binary" kill
+  run_as_commerce "$run_user" "$service_home" "$pm2_binary" kill \
+    || fail_retryable "Could not stop this store's isolated PM2 daemon."
+}
+
+remove_service_account() {
+  run_user=$1
+  service_home=$2
+  pm2_binary=$3
+  delete_attempt=1
+  while [ "$delete_attempt" -le 3 ]; do
+    if [ -d "$service_home" ]; then
+      stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
+    fi
+    if userdel --remove "$run_user"; then
+      if getent passwd "$run_user" >/dev/null; then
+        fail_retryable "The commerce service account remains after userdel."
+      fi
+      return 0
+    fi
+    if ! getent passwd "$run_user" >/dev/null; then
+      return 0
+    fi
+    if [ "$delete_attempt" -lt 3 ]; then
+      sleep "$delete_attempt"
+    fi
+    delete_attempt=$((delete_attempt + 1))
+  done
+  fail_retryable "The commerce service account is still in use after bounded PM2 shutdown attempts."
 }
 
 run_npm_install() {
@@ -1017,7 +1046,8 @@ run_pm2_operation() {
         || fail "Commerce service home is not owned by this store account."
       pm2_binary="$(trusted_binary pm2)"
       run_as_commerce "$run_user" "$service_home" "$pm2_binary" delete "$app_name" >/dev/null 2>&1 || true
-      run_as_commerce "$run_user" "$service_home" "$pm2_binary" save
+      run_as_commerce "$run_user" "$service_home" "$pm2_binary" save \
+        || fail_retryable "Could not save the isolated PM2 process list."
       stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
       ;;
     *) fail "Unsupported PM2 operation." ;;

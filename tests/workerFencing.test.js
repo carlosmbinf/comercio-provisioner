@@ -1,7 +1,13 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 
-const { confirmCloseOrDefer, confirmFinishOrDefer, createFencedClient, shouldFinishRecoveredDeployment } = require("../src/worker");
+const {
+  confirmCloseOrDefer,
+  confirmFinishOrDefer,
+  createFencedClient,
+  runCloseWithAutomaticRetries,
+  shouldFinishRecoveredDeployment,
+} = require("../src/worker");
 
 test("un retry manual de rollback nunca finaliza un journal de deployment activo", () => {
   const activeJournal = { completedSteps: ["verify_site"], state: "ACTIVE" };
@@ -176,4 +182,50 @@ test("un cierre incierto se reintenta una vez y se deja a recuperación sin repe
   assert.equal(uncertain, false);
   assert.equal(attempts, 2);
   assert.equal(deferred, 1);
+});
+
+test("el cierre reintenta fallos operativos tres veces con esperas acotadas", async () => {
+  const attempts = [];
+  const waits = [];
+  const result = await runCloseWithAutomaticRetries({
+    logger: { warn() {} },
+    run: async (attempt) => {
+      attempts.push(attempt);
+      return attempt < 3
+        ? { closeSucceeded: false, retryable: true }
+        : { closeSucceeded: true, retryable: false };
+    },
+    wait: async (delay) => waits.push(delay),
+  });
+
+  assert.deepEqual(attempts, [1, 2, 3]);
+  assert.deepEqual(waits, [3000, 10000]);
+  assert.equal(result.closeSucceeded, true);
+});
+
+test("el cierre no reintenta fallos bloqueados y limita los intentos si persiste el error", async () => {
+  let attempts = 0;
+  const blocked = await runCloseWithAutomaticRetries({
+    logger: { warn() {} },
+    run: async () => {
+      attempts += 1;
+      return { closeSucceeded: false, retryable: false };
+    },
+    wait: async () => assert.fail("un bloqueo no debe esperar otro intento"),
+  });
+  assert.equal(attempts, 1);
+  assert.equal(blocked.retryable, false);
+
+  attempts = 0;
+  const persistent = await runCloseWithAutomaticRetries({
+    logger: { warn() {} },
+    run: async () => {
+      attempts += 1;
+      return { closeSucceeded: false, retryable: true };
+    },
+    wait: async () => {},
+  });
+  assert.equal(attempts, 3);
+  assert.equal(persistent.closeSucceeded, false);
+  assert.equal(persistent.retryable, true);
 });
