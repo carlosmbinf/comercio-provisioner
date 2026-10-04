@@ -752,6 +752,14 @@ remove_site() {
     orphaned_service_home=1
   fi
 
+  if [ "$service_account_exists" -eq 1 ]; then
+    pm2_binary="$(trusted_binary pm2)"
+    if [ -d "$service_home" ]; then
+      stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
+    fi
+    terminate_service_user_processes "$run_user"
+  fi
+
   if [ "$checkout_exists" -eq 1 ]; then
     rm -rf -- "$checkout_directory" || fail_retryable "Could not remove the worker checkout for this store."
   fi
@@ -759,7 +767,6 @@ remove_site() {
     rm -rf -- "$site_directory" || fail_retryable "Could not remove this store's site directory."
   fi
   if [ "$service_account_exists" -eq 1 ]; then
-    pm2_binary="$(trusted_binary pm2)"
     remove_service_account "$run_user" "$service_home" "$pm2_binary"
     if getent passwd "$run_user" >/dev/null; then
       fail_retryable "The commerce service account remains after userdel."
@@ -950,6 +957,53 @@ stop_pm2_daemon() {
     || fail_retryable "Could not stop this store's isolated PM2 daemon."
 }
 
+list_service_user_processes() {
+  process_uid=$1
+  case "$process_uid" in ''|*[!0-9]*) return 1 ;; esac
+  ps_binary="$(trusted_binary ps)"
+  awk_binary="$(trusted_binary awk)"
+  if ! process_table="$("$ps_binary" -eo ruid=,euid=,pid=)"; then
+    return 1
+  fi
+  printf '%s\n' "$process_table" | "$awk_binary" -v uid="$process_uid" \
+    '$1 == uid || $2 == uid { print $3 }'
+}
+
+terminate_service_user_processes() {
+  process_run_user=$1
+  process_uid="$(id -u "$process_run_user" 2>/dev/null)" \
+    || fail_retryable "Could not resolve the commerce service account UID."
+  case "$process_uid" in
+    ''|*[!0-9]*|0) fail "Commerce service account UID is invalid." ;;
+  esac
+
+  process_signal_attempt=1
+  while [ "$process_signal_attempt" -le 5 ]; do
+    process_ids="$(list_service_user_processes "$process_uid")" \
+      || fail_retryable "Could not inspect processes for the commerce service account."
+    [ -n "$process_ids" ] || return 0
+    if [ "$process_signal_attempt" -le 3 ]; then
+      process_signal=TERM
+    else
+      process_signal=KILL
+    fi
+    for process_pid in $process_ids; do
+      case "$process_pid" in
+        ''|*[!0-9]*) fail_retryable "Process inspection returned an invalid PID." ;;
+        0|1) fail_retryable "Process inspection returned a protected system PID." ;;
+      esac
+      kill "-$process_signal" "$process_pid" 2>/dev/null || true
+    done
+    sleep 1
+    process_signal_attempt=$((process_signal_attempt + 1))
+  done
+
+  process_ids="$(list_service_user_processes "$process_uid")" \
+    || fail_retryable "Could not verify shutdown of the commerce service account."
+  [ -z "$process_ids" ] \
+    || fail_retryable "The commerce service account still owns processes after bounded TERM/KILL shutdown."
+}
+
 remove_service_account() {
   run_user=$1
   service_home=$2
@@ -959,6 +1013,7 @@ remove_service_account() {
     if [ -d "$service_home" ]; then
       stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"
     fi
+    terminate_service_user_processes "$run_user"
     if userdel --remove "$run_user"; then
       if getent passwd "$run_user" >/dev/null; then
         fail_retryable "The commerce service account remains after userdel."
@@ -973,7 +1028,7 @@ remove_service_account() {
     fi
     delete_attempt=$((delete_attempt + 1))
   done
-  fail_retryable "The commerce service account is still in use after bounded PM2 shutdown attempts."
+  fail_retryable "The commerce service account is still in use after bounded shutdown attempts."
 }
 
 run_npm_install() {

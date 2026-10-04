@@ -10,7 +10,7 @@ Worker Node independiente de `react-download`. Consume tareas por DDP sobre `wss
 4. En VIDKAR, el administrador principal pulsa **Verificar DNS**. El backend consulta los A records y solo libera el trabajo si todos resuelven al VPS esperado.
 5. El worker vuelve a verificar el DNS y, si sigue correcto, clona `comercio-web`, instala dependencias incluyendo Vite, crea el `.env` por tienda y arranca el servidor Vite con PM2 sin generar `dist`; luego configura Nginx, solicita un lineage Certbot exclusivo de la solicitud y comprueba HTTPS.
 6. Al fallar una etapa, deshace en orden inverso los recursos creados por esa solicitud y reporta `FALLIDA` o `ROLLBACK_FALLIDO`. Si el proceso se reinicia, el lease vencido inicia recuperación desde el journal local.
-7. Para cerrar una web completada, el propietario o el administrador principal solicita el cierre. El worker reclama una tarea con lease, valida el journal y retira en orden PM2, Nginx/systemd, el certificado exclusivo verificable y los archivos/usuario de esa tienda.
+7. Para cerrar una web completada, el propietario o el administrador principal solicita el cierre. El worker reclama una tarea con lease, valida el journal, detiene PM2 y systemd, termina cualquier proceso residual de la cuenta exclusiva de esa tienda (primero `TERM`, luego `KILL` acotado si sigue activo) y retira Nginx, el certificado exclusivo verificable, los archivos y la cuenta. Si no puede confirmar que los procesos terminaron, conserva la cuenta y reintenta el cierre.
 
 La documentación pública de Squarespace no ofrece una API de DNS. Sus Commerce APIs administran datos de tiendas Squarespace y el portal de desarrolladores marca las Reseller APIs de sitios/dominios como “Coming soon”. Referencias: `https://developers.squarespace.com/` y `https://support.squarespace.com/hc/en-us/articles/31119879125645-DNS-records-for-web-hosting`.
 
@@ -34,7 +34,7 @@ Las descargas de VIDKAR se leen de `Meteor.settings.public.empresaAppLinks`; el 
 
 ## Requisitos del VPS
 
-- Node.js 20 o posterior, Git, PM2, Nginx, Certbot y Python 3 (stdlib).
+- Node.js 20 o posterior, Git, PM2, Nginx, Certbot, Python 3 (stdlib) y `procps` (`ps`).
 - DNS A del subdominio resolviendo a `PROVISIONER_PUBLIC_IPV4` antes de que el trabajo salga de `PENDIENTE_DNS`.
 - Crea una cuenta de worker `vidkar-provisioner` y un grupo `vidkar-commerce`; el helper crea una cuenta Linux aislada por subdominio.
 - El checkout Git temporal queda en `PROVISIONER_STATE_DIR/checkouts/<requestId>`, privado para el worker. El helper root valida y materializa solo el código (sin `.git`) en la carpeta de la tienda, propiedad de su cuenta aislada. Git no ejecuta lifecycle scripts; `npm install -f --include=dev` y PM2 corren como esa cuenta, sin token ni clave HMAC del worker. Vite transforma módulos bajo demanda y no se ejecuta `npm run build`.

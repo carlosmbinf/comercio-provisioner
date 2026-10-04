@@ -572,13 +572,34 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   const removeSiteFunction = helper.match(/remove_site\(\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(removeSiteFunction, "debe encontrar la función que retira la tienda");
   assert.match(removeSiteFunction, /remove_service_account "\$run_user" "\$service_home" "\$pm2_binary"/);
+  const processTerminationFunction = helper.match(/terminate_service_user_processes\(\) \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(processTerminationFunction, "debe encontrar la limpieza de procesos de la cuenta aislada");
+  assert.match(processTerminationFunction, /while \[ "\$process_signal_attempt" -le 5 \]/);
+  assert.match(processTerminationFunction, /process_signal=TERM/);
+  assert.match(processTerminationFunction, /process_signal=KILL/);
+  assert.match(processTerminationFunction, /still owns processes after bounded TERM\/KILL shutdown/);
+  assert.match(helper, /ps_binary" -eo ruid=,euid=,pid=/);
+
+  const processStopPosition = removeSiteFunction.indexOf('terminate_service_user_processes "$run_user"');
+  const siteDeletePosition = removeSiteFunction.indexOf('rm -rf -- "$site_directory"');
+  const checkoutDeletePosition = removeSiteFunction.indexOf('rm -rf -- "$checkout_directory"');
+  assert.ok(
+    processStopPosition >= 0
+      && processStopPosition < siteDeletePosition
+      && processStopPosition < checkoutDeletePosition,
+    "debe detener los procesos residuales antes de eliminar archivos de la tienda",
+  );
+
   const removeServiceAccountFunction = helper.match(/remove_service_account\(\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(removeServiceAccountFunction, "debe encontrar el reintento de eliminación de la cuenta");
   const pm2StopPosition = removeServiceAccountFunction.indexOf('stop_pm2_daemon "$run_user" "$service_home" "$pm2_binary"');
+  const processStopBeforeDeletePosition = removeServiceAccountFunction.indexOf('terminate_service_user_processes "$run_user"');
   const userDeletePosition = removeServiceAccountFunction.indexOf('userdel --remove "$run_user"');
   assert.ok(
-    pm2StopPosition >= 0 && userDeletePosition > pm2StopPosition,
-    "debe cerrar el daemon PM2 antes de intentar tres veces eliminar la cuenta",
+    pm2StopPosition >= 0
+      && processStopBeforeDeletePosition > pm2StopPosition
+      && userDeletePosition > processStopBeforeDeletePosition,
+    "debe detener PM2 y los procesos residuales antes de eliminar la cuenta",
   );
   assert.match(removeServiceAccountFunction, /fail_retryable "The commerce service account is still in use/);
 
@@ -586,6 +607,47 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   const unregisteredBranch = removeNginxFunction?.match(/if \[ ! -f "\$permit_file" \]; then([\s\S]*?)\n  fi/)?.[1];
   assert.ok(unregisteredBranch, "debe validar la rama sin registro root");
   assert.doesNotMatch(unregisteredBranch, /nginx -t|systemctl reload nginx/);
+});
+
+test("la limpieza termina procesos residuales del UID de la tienda antes de eliminarlo", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const listProcessesFunction = helper.match(/list_service_user_processes\(\) \{[\s\S]*?\n\}/)?.[0];
+  const terminateProcessesFunction = helper.match(/terminate_service_user_processes\(\) \{([\s\S]*?)\n\}/)?.[0];
+  assert.ok(listProcessesFunction);
+  assert.ok(terminateProcessesFunction);
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-service-process-cleanup-"));
+  const processListFile = path.join(root, "processes");
+  const signalLogFile = path.join(root, "signals");
+  await fs.writeFile(processListFile, "4321\n");
+  try {
+    const script = [
+      'trusted_binary() { printf "%s\\n" "$1"; }',
+      'id() { printf "4242\\n"; }',
+      'ps() { printf "9999 9999 1111\\n"; while IFS= read -r process_pid; do [ -n "$process_pid" ] && printf "4242 4242 %s\\n" "$process_pid"; done < "$PROCESS_LIST_FILE"; }',
+      'kill() { printf "%s:%s\\n" "$1" "$2" >> "$SIGNAL_LOG_FILE"; if [ "$1" = "-KILL" ]; then : > "$PROCESS_LIST_FILE"; fi; }',
+      'sleep() { :; }',
+      'fail_retryable() { printf "AUTO_RETRY: %s\\n" "$1" >&2; exit 75; }',
+      'fail() { printf "%s\\n" "$1" >&2; exit 1; }',
+      listProcessesFunction,
+      terminateProcessesFunction,
+      "terminate_service_user_processes vcommerce-test",
+    ].join("\n");
+    const result = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, PROCESS_LIST_FILE: processListFile, SIGNAL_LOG_FILE: signalLogFile },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      await fs.readFile(signalLogFile, "utf8"),
+      "-TERM:4321\n-TERM:4321\n-TERM:4321\n-KILL:4321\n",
+    );
+    assert.equal(await fs.readFile(processListFile, "utf8"), "");
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
 });
 
 test("el helper evita str.removeprefix para ser compatible con Python 3.8", async () => {
