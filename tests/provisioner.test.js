@@ -887,6 +887,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
   const serviceUserForRequest = extractFunction("service_user_for_request");
   const serviceLayoutFor = extractFunction("service_layout_for");
   const siteDirectoryFor = extractFunction("site_directory_for");
+  const orphanSiteBlock = extractFunction("orphan_site_block");
   const validUidFunction = extractFunction("valid_service_uid");
   const removeOrphanFunction = extractFunction("remove_orphaned_site_directory");
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-orphan-site-recovery-"));
@@ -936,6 +937,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       serviceUserForRequest,
       serviceLayoutFor,
       siteDirectoryFor,
+      orphanSiteBlock,
       validUidFunction,
       "validate_deploy_root() { :; }",
       "getent() {",
