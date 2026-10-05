@@ -7,10 +7,10 @@ Worker Node independiente de `react-download`. Consume tareas por DDP sobre `wss
 1. El propietario habilitado acepta los términos en la web y solicita una o varias páginas, cada una con su propio `slug.vidkar.com`.
 2. VIDKAR guarda la solicitud como `PENDIENTE_DNS`. El worker todavía no clona ni ejecuta nada. El propietario puede cancelarla mientras siga pendiente; queda registrada como `CANCELADA` y libera el subdominio, pero no elimina un registro DNS que ya se haya creado en Squarespace.
 3. El administrador crea manualmente en Squarespace un registro DNS **A** para el host `slug`, con la IPv4 pública reportada por este worker y TTL predeterminado.
-4. En VIDKAR, el administrador principal pulsa **Verificar DNS**. El backend consulta los A records y solo libera el trabajo si todos resuelven al VPS esperado.
+4. El backend de VIDKAR comprueba automáticamente cada 60 segundos las solicitudes `PENDIENTE_DNS` y solo las libera cuando todos los A records resuelven a la IPv4 válida más reciente reportada por el worker. El administrador principal conserva el botón **Verificar DNS** para iniciar la misma comprobación manualmente.
 5. El worker vuelve a verificar el DNS y, si sigue correcto, clona `comercio-web`, instala dependencias incluyendo Vite, crea el `.env` por tienda y arranca el servidor Vite con PM2 sin generar `dist`; luego configura Nginx, solicita un lineage Certbot exclusivo de la solicitud y comprueba HTTPS.
 6. Al fallar una etapa, deshace en orden inverso los recursos creados por esa solicitud y reporta `FALLIDA` o `ROLLBACK_FALLIDO`. Si el proceso se reinicia, el lease vencido inicia recuperación desde el journal local.
-7. Para cerrar una web completada, el propietario o el administrador principal solicita el cierre. El worker reclama una tarea con lease, valida el journal, detiene PM2 y systemd, termina cualquier proceso residual de la cuenta exclusiva de esa tienda (primero `TERM`, luego `KILL` acotado si sigue activo) y retira Nginx, el certificado exclusivo verificable, los archivos y la cuenta. Si no puede confirmar que los procesos terminaron, conserva la cuenta y reintenta el cierre.
+7. Para cerrar una web completada, el propietario o el administrador principal solicita el cierre. El worker reclama una tarea con lease, valida el journal, detiene PM2 y systemd, termina cualquier proceso residual de la cuenta exclusiva de esa tienda (primero `TERM`, luego `KILL` acotado si sigue activo) y retira Nginx, el certificado exclusivo verificable, los archivos y la cuenta. Si no puede confirmar que los procesos terminaron, conserva la cuenta y reintenta el cierre. Cuando queda en espera de un reintento operativo, el propietario puede adelantarlo desde Empresa y el administrador principal desde la cola; se conservan los pasos completados y no se evitan bloqueos de seguridad o propiedad.
 
 La documentación pública de Squarespace no ofrece una API de DNS. Sus Commerce APIs administran datos de tiendas Squarespace y el portal de desarrolladores marca las Reseller APIs de sitios/dominios como “Coming soon”. Referencias: `https://developers.squarespace.com/` y `https://support.squarespace.com/hc/en-us/articles/31119879125645-DNS-records-for-web-hosting`.
 
@@ -36,30 +36,23 @@ Las descargas de VIDKAR se leen de `Meteor.settings.public.empresaAppLinks`; el 
 
 - Node.js 20 o posterior, Git, PM2, Nginx, Certbot, Python 3 (stdlib) y `procps` (`ps`).
 - DNS A del subdominio resolviendo a `PROVISIONER_PUBLIC_IPV4` antes de que el trabajo salga de `PENDIENTE_DNS`.
-- Crea una cuenta de worker `vidkar-provisioner` y un grupo `vidkar-commerce`; el helper crea una cuenta Linux aislada por subdominio.
-- El checkout Git temporal queda en `PROVISIONER_STATE_DIR/checkouts/<requestId>`, privado para el worker. El helper root valida y materializa solo el código (sin `.git`) en la carpeta de la tienda, propiedad de su cuenta aislada. Git no ejecuta lifecycle scripts; `npm install -f --include=dev` y PM2 corren como esa cuenta, sin token ni clave HMAC del worker. Vite transforma módulos bajo demanda y no se ejecuta `npm run build`.
-- Si el repo es privado, instala una deploy key de solo lectura en el home de `vidkar-provisioner` (`~/.ssh`); Git clona a staging con la configuración global y del sistema deshabilitada.
+- Crea el grupo `vidkar-commerce`; el helper crea una cuenta Linux aislada por subdominio. El proceso Node/PM2 del provisioner se ejecuta como `root`.
+- El checkout Git temporal queda en `PROVISIONER_STATE_DIR/checkouts/<requestId>`, privado y propiedad de `root`. El helper valida y materializa solo el código (sin `.git`) en la carpeta de la tienda, propiedad de su cuenta aislada. Git no ejecuta lifecycle scripts; `npm install -f --include=dev` y el PM2 de cada sitio siguen corriendo como esa cuenta, sin token ni clave HMAC del worker. Vite transforma módulos bajo demanda y no se ejecuta `npm run build`. El helper también admite staging del usuario legacy `vidkar-provisioner` durante la migración.
+- Si el repo es privado, instala una deploy key de solo lectura en `/root/.ssh`; Git clona a staging con la configuración global y del sistema deshabilitada.
 - Instala el helper root-owned en `/usr/local/sbin/vidkar-commerce-helper`. Su key HMAC root-only valida un conjunto cerrado de acciones y valores.
-- `PROVISIONER_STATE_DIR` debe ser privado (modo `0700`); el worker escribe journals y el helper crea los `.env` por tienda con modo `0600`.
+- `PROVISIONER_STATE_DIR` debe ser root-owned y privado (modo `0700`); root escribe journals/locks y el helper crea los `.env` por tienda con modo `0600`.
+- Instala el código, `node_modules` y `ecosystem.config.cjs` en una ruta root-owned no modificable por usuarios sin privilegios (preferiblemente fuera de `/home/cloud`); el `.env` debe ser `root:root` con modo `0600`. El proceso root carga código, dependencias, token DDP y clave HMAC, por lo que no debe poder modificarlos otro usuario.
 - `/opt`, `/opt/vidkar`, `/opt/vidkar/comercios`, `/var/lib/vidkar-commerce` y las carpetas de Nginx administradas deben ser directorios reales root-owned y no escribibles por grupo/otros. El helper se niega a borrar si encuentra symlinks, ownership o permisos inesperados.
 
-En la preparación manual del VPS, instala el helper desde este repositorio como `root:root` con permisos `0755`. Crea el usuario dedicado del worker y el grupo `vidkar-commerce`; mediante `visudo`, permite al worker ejecutar **solo** el helper root firmado. Git solo clona al staging como el worker; `npm install -f --include=dev` y PM2 siempre se ejecutan bajo la cuenta aislada de la tienda, sin sudo directo para esos binarios ni para ejecutar el worker como root.
+En la preparación manual del VPS, instala el helper desde este repositorio como `root:root` con permisos `0755` y crea el grupo `vidkar-commerce`. El usuario legacy `vidkar-provisioner` puede conservarse para permitir la limpieza de staging antiguo; el worker actual no depende de él ni requiere una regla sudoers propia. El helper sigue validando firmas HMAC y ejecutando las operaciones de cada tienda bajo su cuenta aislada.
 
 Ejemplo de preparación única (el helper y la clave deben permanecer root-owned):
 
 ```sh
 sudo install -o root -g root -m 0755 scripts/vidkar-commerce-helper /usr/local/sbin/vidkar-commerce-helper
 sudo groupadd --system vidkar-commerce
-sudo useradd --system --create-home --home-dir /var/lib/vidkar-provisioner --shell /usr/sbin/nologin vidkar-provisioner
 sudo install -d -o root -g root -m 0755 /etc/vidkar
 sudo install -o root -g root -m 0600 /dev/null /etc/vidkar/commerce-helper.key
-sudo visudo -f /etc/sudoers.d/vidkar-commerce-provisioner
-```
-
-En el archivo `sudoers`, añade únicamente esta regla; el worker no debe tener sudo genérico ni sudo directo para Git/npm/PM2:
-
-```text
-vidkar-provisioner ALL=(root) NOPASSWD: /usr/local/sbin/vidkar-commerce-helper
 ```
 
 El helper crea una unidad systemd de PM2 por comercio; no se requiere configurar `pm2 startup` manualmente por tienda. Los nombres/binarios de Git/npm/PM2 deben estar en rutas root-owned ejecutables dentro de `/usr/bin` o `/usr/local/bin`.
@@ -68,11 +61,24 @@ Genera `PROVISIONER_TOKEN` con un generador criptográfico local (mínimo 32 byt
 
 Genera aparte `PROVISIONER_HELPER_HMAC_SECRET` (otro secreto aleatorio distinto) y colócalo también en `/etc/vidkar/commerce-helper.key`, propiedad `root:root`, modo `0600`. La clave del helper nunca va a Meteor ni se hereda a Git/npm/PM2; cada operación privilegiada lleva una firma HMAC específica de acción y argumentos.
 
-El usuario del worker no debe pertenecer al grupo `vidkar-commerce`. Cada tienda tiene un usuario y home propios con permisos `0700`; su `.env` contiene solo configuración pública de Vite y queda con propietario de esa tienda y modo `0600`.
+El usuario root del provisioner no se usa para ejecutar el código de las tiendas. Cada tienda tiene un usuario y home propios con permisos `0700`; su `.env` contiene solo configuración pública de Vite y queda con propietario de esa tienda y modo `0600`.
 
 ## Ejecución
 
-Instala dependencias en este directorio y ejecuta `npm run check` y `npm test`. Para producción, configura el `.env`, valida el SHA-256 correspondiente en `react-download/settings.json` y arranca `ecosystem.config.cjs` con PM2. No ejecutes el worker contra producción hasta completar DNS, permisos y una prueba en un subdominio de staging.
+Instala dependencias en una ubicación root-owned y ejecuta `npm run check` y `npm test`. Para producción, configura el `.env`, valida el SHA-256 correspondiente en `react-download/settings.json` y arranca `pm2 start ecosystem.config.cjs` como `root`. El PM2 de root es independiente del PM2 que pudiera tener `vidkar-provisioner`: detén el worker anterior antes de migrar para evitar dos procesos y locks concurrentes. Tras arrancar, guarda el proceso con `pm2 save` y configura el inicio del daemon de root con `pm2 startup systemd -u root --hp /root` (aplica el comando que PM2 imprima). No ejecutes el worker contra producción hasta completar la migración de permisos y una prueba en un subdominio de staging.
+
+### Migración del worker a root
+
+Hazla una sola vez y con el worker de `vidkar-provisioner` detenido. El `stateDir` y el directorio de locks deben pertenecer al mismo UID que ejecuta el worker; el código rechaza un cambio de propietario implícito para no pisar locks activos. Migra el padre y su estado a `root:root`, manteniendo modo privado en el estado:
+
+```sh
+sudo chown root:root /var/lib/vidkar-provisioner
+sudo chmod 0755 /var/lib/vidkar-provisioner
+sudo chown -R root:root /var/lib/vidkar-provisioner/state
+sudo chmod 0700 /var/lib/vidkar-provisioner/state
+```
+
+Conserva la deploy key privada del repositorio en `/root/.ssh` con permisos restrictivos. No arranques simultáneamente el daemon de PM2 del usuario legacy y el daemon root.
 
 El worker solo acepta `*.vidkar.com`; no modifica ni solicita acceso a la cuenta de Squarespace. Los registros A se crean manualmente en el panel DNS. Antes de desplegar, el worker rechaza un checkout de `comercio-web` que tenga `.env` versionado: el `.gitignore` evita que se agreguen nuevos, pero no saca automáticamente del índice los que ya estén tracked.
 
@@ -87,12 +93,13 @@ El journal registra directorio, puerto, nombre PM2, certificado, enlace/configur
 - El orden es deliberado: detener el proceso PM2 de esa tienda, cerrar también su daemon aislado y confirmar que liberó su puerto; retirar únicamente su unidad systemd y sus archivos/enlaces `sites-available`/`sites-enabled` marcados con ese `requestId`; reconciliar su certificado; y solo entonces borrar `/opt/vidkar/comercios/<slug>`, el home/usuario aislado y el staging de ese `requestId`. El paso de eliminación de la cuenta vuelve a cerrar el daemon PM2 de forma idempotente y reintenta `userdel` tres veces para recuperarse de cierres anteriores en los que PM2 se retiró pero el daemon quedó activo.
 - Los fallos operativos identificados se reintentan hasta tres veces por ejecución (esperas de 3 y 10 segundos). Si persisten, el backend programa otro intento automáticamente con espera exponencial (1, 2, 4 minutos y así sucesivamente, con un máximo de 30 minutos); los pasos `COMPLETADO` se conservan y se omiten. Los cierres históricos sin la versión de política actual se revalidan automáticamente una vez, incluso si un worker anterior dejó una marca genérica de bloqueo. El worker vuelve a verificar propiedad y seguridad; si el riesgo persiste, conserva los recursos y requiere revisión. No se pide una acción al propietario ni al administrador para errores operativos.
 - Una validación de propiedad o seguridad (por ejemplo, journal ausente o inconsistente, ruta inesperada, symlink o ownership distinto) bloquea el cierre en `CIERRE_FALLIDO`. No se borran recursos dudosos; solo esos bloqueos requieren revisión manual. Si el lease expira con un paso `EN_PROGRESO`, ese paso se considera interrumpido y se vuelve a ejecutar idempotentemente.
+- Si falta el registro root-owned de una solicitud pero existe un registro de dominio root-owned, regular y modo `0600` que vincula exactamente ese slug con el mismo `requestId`, el helper puede reconstruir el permiso y reintentar la limpieza. Si esa prueba falta, no coincide o tiene permisos inesperados, conserva los recursos y exige revisión manual; no se infiere propiedad solo por el nombre del usuario o la carpeta.
 - No se modifica `nginx.conf`, el sitio por defecto, otros archivos de Nginx, el webroot ACME compartido ni certificados de otros comercios. Nginx se valida con `nginx -t` antes de recargarlo.
 - Los certificados nuevos usan un nombre derivado de slug y solicitud y un marcador root-owned. Al cerrar, Certbot elimina ese lineage marcado; para instalaciones antiguas sin marcador, también puede retirar el lineage cuyo nombre coincide exactamente con el hostname de la tienda. En ambos casos exige que el SAN DNS sea exactamente ese host y que no haya referencias desde Nginx, Apache, Caddy, HAProxy, Traefik, lighttpd ni unidades systemd (incluidas rutas `live` y `archive`). Se preservan certificados multi-dominio, referenciados por otro servicio o imposibles de verificar. `certbot delete` elimina el lineage local, no revoca el certificado emitido públicamente.
-- El worker **no controla Squarespace**: el registro DNS A fue creado manualmente y no se borra al cerrar. Después del cierre, administración debe quitar manualmente solo el registro A de ese subdominio en Squarespace. No se toca la zona DNS completa.
+- El worker **no controla Squarespace**: el registro DNS A fue creado manualmente y no se borra al cerrar. Si el subdominio se reutilizará, incluso por otro propietario, conserva ese registro apuntando al VPS; solo si se retira permanentemente, administración debe quitar manualmente ese A. No se toca la zona DNS completa.
 - Cerrar la web no elimina la empresa VIDKAR, sus tiendas del catálogo, productos, categorías, imágenes, ventas, pedidos, pagos ni datos Mongo. Las imágenes viven en el almacenamiento del backend Meteor, fuera del checkout de Vite.
-- Las solicitudes cerradas quedan retenidas para auditoría, pero no reservan el subdominio: el mismo propietario puede reutilizarlo o crear otras páginas con slugs independientes. Cada subdominio sigue reservado mientras su solicitud tenga recursos activos o un cierre/rollback pendiente.
+- Las solicitudes cerradas quedan retenidas para auditoría, pero liberan el subdominio: el mismo u otro propietario habilitado puede solicitar de nuevo el mismo slug. Es una solicitud nueva, con otro `requestId` y `ownerId`; al desplegar, el worker genera el entorno con el nuevo `ownerId` y `displayName`. El cierre de la web no elimina los datos comerciales del propietario anterior en Mongo. Mientras la solicitud anterior conserve recursos o tenga un cierre/rollback pendiente, el subdominio sigue reservado y no puede asignarse a otro flujo.
 
 ### Despliegue de la capacidad de cierre
 
-Despliega primero el backend Meteor actualizado para admitir la espera y reentrada automática; instala después este helper como `root:root` en `/usr/local/sbin/vidkar-commerce-helper` con modo `0755`; actualiza/reinicia el worker y finalmente publica la UI. El registro anuncia si el worker admite reintentos automáticos: workers anteriores no reclaman tareas diferidas ni recuperan cierres históricos. El helper anterior no reconoce `remove-certificate` y no entiende los reintentos estructurados. Los cierres históricos sin la versión de política actual serán revalidados automáticamente una vez por el nuevo backend y worker. Prueba primero con una tienda de staging y comprueba que otro subdominio permanece disponible.
+Despliega primero el backend Meteor actualizado para admitir la espera y reentrada automática; instala después este helper como `root:root` en `/usr/local/sbin/vidkar-commerce-helper` con modo `0755`; actualiza/reinicia el worker **como `root`** y finalmente publica la UI. El registro anuncia si el worker admite reintentos automáticos: workers anteriores no reclaman tareas diferidas ni recuperan cierres históricos. El helper anterior no reconoce `remove-certificate` ni la reconciliación del registro root-owned. Los cierres históricos sin la versión de política actual serán revalidados automáticamente una vez por el nuevo backend y worker. Prueba primero con una tienda de staging y comprueba que otro subdominio permanece disponible.

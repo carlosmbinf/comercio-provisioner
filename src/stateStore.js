@@ -12,8 +12,11 @@ const createStateStore = (rootDirectory, fsApi = fs) => {
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
       throw new Error("El stateDir debe ser un directorio real, no un symlink.");
     }
-    if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
-      throw new Error("El stateDir debe pertenecer al usuario del worker.");
+    const processUid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (processUid !== null && stat.uid !== processUid) {
+      throw new Error(processUid === 0
+        ? "El stateDir debe pertenecer a root; migra el estado con el worker detenido antes de ejecutarlo como root."
+        : "El stateDir debe pertenecer al usuario del worker.");
     }
     await fsApi.chmod(root, 0o700);
   };

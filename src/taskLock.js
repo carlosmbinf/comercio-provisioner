@@ -49,9 +49,14 @@ const createTaskLock = ({ rootDirectory, pid = process.pid, workerId, kill = pro
     if (!isSafeRequestId(requestId)) throw new Error("Identificador de tarea no válido para lock local.");
     await fs.mkdir(root, { recursive: true, mode: 0o700 });
     const rootInfo = await fs.lstat(root);
-    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()
-      || (typeof process.getuid === "function" && rootInfo.uid !== process.getuid())) {
-      throw new Error("El directorio de locks debe ser real y pertenecer al worker.");
+    const processUid = typeof process.getuid === "function" ? process.getuid() : null;
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+      throw new Error("El directorio de locks debe ser un directorio real, no un symlink.");
+    }
+    if (processUid !== null && rootInfo.uid !== processUid) {
+      throw new Error(processUid === 0
+        ? "El directorio de locks debe pertenecer a root; migra el stateDir con el worker anterior detenido."
+        : "El directorio de locks debe pertenecer al usuario del worker.");
     }
     await fs.chmod(root, 0o700);
     const lockPath = path.join(root, `${requestId}.lock`);

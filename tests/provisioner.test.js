@@ -604,8 +604,10 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   assert.match(removeServiceAccountFunction, /fail_retryable "The commerce service account is still in use/);
 
   const removeNginxFunction = helper.match(/remove_nginx\(\) \{([\s\S]*?)\n\}/)?.[1];
-  const unregisteredBranch = removeNginxFunction?.match(/if \[ ! -f "\$permit_file" \]; then([\s\S]*?)\n  fi/)?.[1];
+  const unregisteredBranch = removeNginxFunction?.match(/if \[ ! -f "\$permit_file" \] \|\| \[ -L "\$permit_file" \]; then([\s\S]*?)\n  fi/)?.[1];
   assert.ok(unregisteredBranch, "debe validar la rama sin registro root");
+  assert.match(unregisteredBranch, /restore_request_registration_from_domain/);
+  assert.match(unregisteredBranch, /Resources exist without a verifiable root-owned request registration/);
   assert.doesNotMatch(unregisteredBranch, /nginx -t|systemctl reload nginx/);
 });
 
@@ -688,6 +690,115 @@ test("el .env de cada tienda usa el grupo vidkar-commerce creado por prepare-sit
   assert.match(helper, /useradd .*--gid vidkar-commerce "\$run_user"/);
   assert.match(helper, /chown "\$run_user:vidkar-commerce" "\$environment_file"/);
   assert.doesNotMatch(helper, /chown "\$run_user:\$run_user" "\$environment_file"/);
+});
+
+test("el helper restaura un permiso perdido solo desde el registro root-owned del mismo dominio y requestId", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const extractFunction = (name) => {
+    const match = helper.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, "m"));
+    assert.ok(match, `debe existir la función ${name}`);
+    return match[0];
+  };
+  const rootOwnedStateFunction = extractFunction("root_owned_private_state_file");
+  const matchingDomainFunction = extractFunction("domain_registration_matches_request");
+  const restoreFunction = extractFunction("restore_request_registration_from_domain");
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-request-registration-recovery-"));
+  let scenario = 0;
+
+  const runRecovery = async ({
+    requestId = "request-recovery",
+    recordedRequestId = requestId,
+    owner = "0:0",
+    mode = "600",
+    symlink = false,
+    missing = false,
+  } = {}) => {
+    const stateDirectory = path.join(root, `scenario-${scenario}`);
+    scenario += 1;
+    await fs.mkdir(stateDirectory);
+    const domainFile = path.join(stateDirectory, "domain-tienda");
+    if (!missing) {
+      if (symlink) {
+        await fs.writeFile(path.join(stateDirectory, "domain-target"), `${recordedRequestId}\n`);
+        await fs.symlink("domain-target", domainFile);
+      } else {
+        await fs.writeFile(domainFile, `${recordedRequestId}\n`);
+      }
+    }
+
+    const script = [
+      "stat() {",
+      '  [ "$1" = "-c" ] || return 1',
+      '  [ "$3" = "$DOMAIN_FILE" ] || return 1',
+      '  case "$2" in',
+      '    "%u:%g") printf "%s\\n" "$STATE_OWNER" ;;',
+      '    "%a") printf "%s\\n" "$STATE_MODE" ;;',
+      "    *) return 1 ;;",
+      "  esac",
+      "}",
+      rootOwnedStateFunction,
+      matchingDomainFunction,
+      restoreFunction,
+      'register_request() { printf "%s:%s:%s\\n" "$1" "$2" "$3" > "$HELPER_STATE_DIR/restored"; }',
+      'require_request() { :; }',
+      'restore_request_registration_from_domain "$REQUEST_ID" "$SLUG" "$RUN_USER"',
+    ].join("\n");
+    const result = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DOMAIN_FILE: domainFile,
+        HELPER_STATE_DIR: stateDirectory,
+        REQUEST_ID: requestId,
+        RUN_USER: "vcommerce-123456789abc",
+        SLUG: "tienda",
+        STATE_MODE: mode,
+        STATE_OWNER: owner,
+      },
+    });
+    const restored = await fs.readFile(path.join(stateDirectory, "restored"), "utf8").catch(() => null);
+    return { restored, status: result.status, stderr: result.stderr };
+  };
+
+  try {
+    const recovered = await runRecovery();
+    assert.equal(recovered.status, 0, recovered.stderr);
+    assert.equal(recovered.restored, "request-recovery:tienda:vcommerce-123456789abc\n");
+
+    for (const invalidProof of [
+      { recordedRequestId: "different-request" },
+      { owner: "1000:1000" },
+      { mode: "644" },
+      { symlink: true },
+      { missing: true },
+    ]) {
+      const refused = await runRecovery(invalidProof);
+      assert.equal(refused.status, 1, JSON.stringify(invalidProof));
+      assert.equal(refused.restored, null, JSON.stringify(invalidProof));
+    }
+
+    assert.match(helper, /Site resources exist without a verifiable root-owned request registration/);
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
+test("el helper acepta staging root-owned o del worker legacy, pero rechaza otros propietarios", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const match = helper.match(/^worker_storage_owner_allowed\(\) \{\n[\s\S]*?^\}/m);
+  assert.ok(match, "debe existir la validación de propietario del staging");
+
+  const result = spawnSync("sh", ["-c", [
+    match[0],
+    "worker_storage_owner_allowed root",
+    "worker_storage_owner_allowed vidkar-provisioner",
+    "! worker_storage_owner_allowed cloud",
+  ].join("\n")], { encoding: "utf8" });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(helper, /validate_worker_storage_directory "\$checkout_directory"/);
 });
 
 test("el rollback reporta cada etapa terminada sin ejecutar operaciones privilegiadas inexistentes", async () => {

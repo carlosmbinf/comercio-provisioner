@@ -135,6 +135,13 @@ prepare_helper_state() {
   chmod 0700 "$HELPER_STATE_DIR"
 }
 
+root_owned_private_state_file() {
+  state_file=$1
+  [ -f "$state_file" ] && [ ! -L "$state_file" ] \
+    && [ "$(stat -c '%u:%g' "$state_file" 2>/dev/null || true)" = "0:0" ] \
+    && [ "$(stat -c '%a' "$state_file" 2>/dev/null || true)" = "600" ]
+}
+
 register_request() {
   request_id=$1
   slug=$2
@@ -142,10 +149,12 @@ register_request() {
   prepare_helper_state
   permit_file="$HELPER_STATE_DIR/$request_id"
   domain_file="$HELPER_STATE_DIR/domain-$slug"
-  if [ -f "$domain_file" ]; then
+  if [ -e "$domain_file" ] || [ -L "$domain_file" ]; then
+    root_owned_private_state_file "$domain_file" || fail "Domain registration must be a root-owned 0600 regular file."
     [ "$(cat "$domain_file")" = "$request_id" ] || fail "This subdomain is already assigned to another request."
   fi
-  if [ -f "$permit_file" ]; then
+  if [ -e "$permit_file" ] || [ -L "$permit_file" ]; then
+    root_owned_private_state_file "$permit_file" || fail "Request registration must be a root-owned 0600 regular file."
     [ "$(sed -n '1p' "$permit_file")" = "$slug" ] || fail "Request ID is already bound to another subdomain."
     [ "$(sed -n '2p' "$permit_file")" = "$run_user" ] || fail "Request ID is already bound to another service user."
     return
@@ -169,9 +178,36 @@ require_request() {
   prepare_helper_state
   permit_file="$HELPER_STATE_DIR/$request_id"
   [ -f "$permit_file" ] || fail "No privileged registration exists for this request."
+  [ ! -L "$permit_file" ] || fail "Privileged request registration must not be a symlink."
+  root_owned_private_state_file "$permit_file" || fail "Privileged request registration must be root-owned with mode 0600."
   [ "$(sed -n '1p' "$permit_file")" = "$slug" ] || fail "Request ID is registered for a different subdomain."
   [ "$(sed -n '2p' "$permit_file")" = "$run_user" ] || fail "Request ID is registered for a different service user."
-  [ "$(cat "$HELPER_STATE_DIR/domain-$slug")" = "$request_id" ] || fail "Subdomain is not registered to this request."
+  domain_file="$HELPER_STATE_DIR/domain-$slug"
+  [ -f "$domain_file" ] && [ ! -L "$domain_file" ] || fail "Subdomain ownership record is missing or is not a regular file."
+  root_owned_private_state_file "$domain_file" || fail "Subdomain ownership record must be root-owned with mode 0600."
+  [ "$(cat "$domain_file")" = "$request_id" ] || fail "Subdomain is not registered to this request."
+}
+
+domain_registration_matches_request() {
+  domain_registration_request_id=$1
+  domain_registration_slug=$2
+  domain_registration_file="$HELPER_STATE_DIR/domain-$domain_registration_slug"
+  root_owned_private_state_file "$domain_registration_file" \
+    && [ "$(cat "$domain_registration_file" 2>/dev/null || true)" = "$domain_registration_request_id" ]
+}
+
+restore_request_registration_from_domain() {
+  restore_request_id=$1
+  restore_slug=$2
+  restore_run_user=$3
+  restore_permit_file="$HELPER_STATE_DIR/$restore_request_id"
+  if [ -e "$restore_permit_file" ] || [ -L "$restore_permit_file" ]; then
+    return 1
+  fi
+  domain_registration_matches_request "$restore_request_id" "$restore_slug" || return 1
+  register_request "$restore_request_id" "$restore_slug" "$restore_run_user"
+  require_request "$restore_request_id" "$restore_slug" "$restore_run_user"
+  printf '%s\n' "REQUEST_REGISTRATION_RESTORED"
 }
 
 valid_service_uid() {
@@ -223,6 +259,23 @@ validate_directory_not_group_writable() {
   permission_mode="$(stat -c '%a' "$permission_directory")"
   [ "$((0$permission_mode & 0022))" -eq 0 ] \
     || fail "A managed parent directory is writable by group or other users."
+}
+
+worker_storage_owner_allowed() {
+  case "$1" in
+    root|vidkar-provisioner) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_worker_storage_directory() {
+  storage_directory=$1
+  [ ! -L "$storage_directory" ] && [ -d "$storage_directory" ] \
+    || fail "Worker storage directory is missing or a symlink."
+  storage_owner="$(stat -c '%U' "$storage_directory")"
+  worker_storage_owner_allowed "$storage_owner" \
+    || fail "Worker storage directory has unexpected ownership."
+  validate_directory_not_group_writable "$storage_directory"
 }
 
 validate_service_home_parent() {
@@ -447,12 +500,14 @@ remove_nginx() {
   service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
 
   permit_file="$HELPER_STATE_DIR/$request_id"
-  if [ ! -f "$permit_file" ]; then
+  if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
     if [ -e "$config_file" ] || [ -L "$config_file" ] || [ -e "$enabled_link" ] || [ -L "$enabled_link" ] \
       || [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
-      fail "Resources exist without a root-owned request registration; manual review is required."
+      restore_request_registration_from_domain "$request_id" "$slug" "$run_user" \
+        || fail "Resources exist without a verifiable root-owned request registration; manual review is required."
+    else
+      return 0
     fi
-    return 0
   fi
   require_request "$request_id" "$slug" "$run_user"
 
@@ -513,11 +568,13 @@ remove_certificate() {
     fail "Refusing to remove a certificate while the requested NGINX site still exists."
   fi
 
-  if [ ! -f "$permit_file" ]; then
+  if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
     if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
-      fail "Certificate ownership exists without a matching root-owned request registration."
+      restore_request_registration_from_domain "$request_id" "$slug" "$run_user" \
+        || fail "Certificate ownership exists without a matching root-owned request registration."
+    else
+      return 0
     fi
-    return 0
   fi
   require_request "$request_id" "$slug" "$run_user"
 
@@ -675,19 +732,26 @@ remove_site() {
   permit_file="$HELPER_STATE_DIR/$request_id"
   certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
   service_home="/var/lib/vidkar-commerce/$slug"
-  if [ ! -f "$permit_file" ]; then
+  if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
+    if [ -e "$permit_file" ] || [ -L "$permit_file" ]; then
+      fail "Request registration exists but is not a regular root-owned file; manual review is required."
+    fi
     if [ -e "$site_directory" ] || [ -L "$site_directory" ] \
       || [ -e "$service_home" ] || [ -L "$service_home" ] \
       || getent passwd "$run_user" >/dev/null; then
-      fail "Site resources exist without a root-owned request registration; manual review is required."
+      restore_request_registration_from_domain "$request_id" "$slug" "$run_user" \
+        || fail "Site resources exist without a verifiable root-owned request registration; manual review is required."
+    else
+      if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+        fail "Certificate ownership remains without a root-owned request registration; manual review is required."
+      fi
+      if [ -e "$domain_file" ] || [ -L "$domain_file" ]; then
+        domain_registration_matches_request "$request_id" "$slug" \
+          || fail "Domain ownership record cannot be reconciled with this request; manual review is required."
+        rm -f "$domain_file" || fail_retryable "Could not remove the completed domain ownership record."
+      fi
+      return 0
     fi
-    if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
-      fail "Certificate ownership remains without a root-owned request registration; manual review is required."
-    fi
-    if [ "$(cat "$domain_file" 2>/dev/null || true)" = "$request_id" ]; then
-      rm -f "$domain_file" || fail_retryable "Could not remove the completed domain ownership record."
-    fi
-    return 0
   fi
   require_request "$request_id" "$slug" "$run_user"
   validate_deploy_root
@@ -718,14 +782,10 @@ remove_site() {
       || fail "The system library root is not a root-owned real directory."
     validate_directory_not_group_writable /var/lib
     for checkout_parent in /var/lib/vidkar-provisioner /var/lib/vidkar-provisioner/state "$WORKER_CHECKOUT_ROOT"; do
-      [ ! -L "$checkout_parent" ] && [ -d "$checkout_parent" ] \
-        || fail "Worker staging parent is not a real directory."
-      [ "$(stat -c '%U' "$checkout_parent")" = "vidkar-provisioner" ] \
-        || fail "Worker staging parent has unexpected ownership."
-      validate_directory_not_group_writable "$checkout_parent"
+      validate_worker_storage_directory "$checkout_parent"
     done
     [ -d "$checkout_directory" ] || fail "Refusing to remove an unexpected staging checkout path."
-    [ "$(stat -c '%U' "$checkout_directory")" = "vidkar-provisioner" ] || fail "Staging checkout has unexpected ownership."
+    validate_worker_storage_directory "$checkout_directory"
     checkout_exists=1
   fi
 
@@ -1092,6 +1152,10 @@ run_pm2_operation() {
         fi
         fail "Cannot stop PM2 because the registered service account is missing while site resources remain."
       fi
+      if [ ! -f "$HELPER_STATE_DIR/$request_id" ] || [ -L "$HELPER_STATE_DIR/$request_id" ]; then
+        restore_request_registration_from_domain "$request_id" "$slug" "$run_user" \
+          || fail "The service account exists without a verifiable root-owned request registration."
+      fi
       require_request "$request_id" "$slug" "$run_user"
       [ "$(printf '%s' "$service_account_entry" | cut -d: -f6)" = "$service_home" ] \
         || fail "Cannot stop PM2 because the service home does not match this store."
@@ -1115,13 +1179,14 @@ materialize_site() {
   run_user=$3
   validate_service_user "$slug" "$run_user"
   require_request "$request_id" "$slug" "$run_user"
-  worker_account=vidkar-provisioner
   checkout_directory="$WORKER_CHECKOUT_ROOT/$request_id"
   site_directory="$DEPLOY_ROOT/$slug"
   [ ! -L "$WORKER_CHECKOUT_ROOT" ] && [ -d "$WORKER_CHECKOUT_ROOT" ] || fail "Worker checkout root is missing or a symlink."
-  [ "$(stat -c '%U' "$WORKER_CHECKOUT_ROOT")" = "$worker_account" ] || fail "Worker checkout root has unexpected ownership."
+  for checkout_parent in /var/lib/vidkar-provisioner /var/lib/vidkar-provisioner/state "$WORKER_CHECKOUT_ROOT"; do
+    validate_worker_storage_directory "$checkout_parent"
+  done
   [ ! -L "$checkout_directory" ] && [ -d "$checkout_directory" ] || fail "Staging checkout is missing or a symlink."
-  [ "$(stat -c '%U' "$checkout_directory")" = "$worker_account" ] || fail "Staging checkout has unexpected ownership."
+  validate_worker_storage_directory "$checkout_directory"
   [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || fail "Commerce site directory is missing or a symlink."
   [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory has unexpected ownership."
   find "$site_directory" -mindepth 1 -maxdepth 1 -print -quit | grep -q . && fail "Commerce site directory is not empty."
