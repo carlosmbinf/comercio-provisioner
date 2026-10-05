@@ -748,6 +748,7 @@ test("el .env se instala con file descriptors sin seguir symlinks controlados po
 test("el helper deriva cuenta, carpeta, home y unidad nuevas desde requestId y conserva layout legacy", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");
+  assert.match(helper, /Legacy subdomain resources remain; reconcile the previous flow before creating a request-scoped site/);
   const extractFunction = (name) => {
     const match = helper.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, "m"));
     assert.ok(match, `debe existir la función ${name}`);
@@ -899,20 +900,27 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     domainMarker = false,
     environmentRequestId = requestId,
     mode = "700",
+    requestScopedAccount = false,
     reusedUid = false,
     siteGroup = "vidkar-commerce",
   } = {}) => {
     const scenarioRoot = path.join(root, `case-${scenario}`);
     scenario += 1;
     const deployRoot = path.join(scenarioRoot, "deploy");
-    const siteDirectory = path.join(deployRoot, slug);
+    const requestRunUser = requestScopedAccount
+      ? createServiceUsername(slug, requestId)
+      : createLegacyServiceUsername(slug);
+    const siteDirectory = path.join(deployRoot, requestScopedAccount ? `${slug}--${requestId}` : slug);
     const environmentFile = path.join(siteDirectory, ".env");
-    const serviceHome = path.join(scenarioRoot, "home", slug);
+    const serviceHome = path.join(scenarioRoot, "home", requestScopedAccount ? requestRunUser : slug);
     const stateDirectory = path.join(scenarioRoot, "state");
-    const requestRunUser = createLegacyServiceUsername(slug);
     const siteUid = "996";
     const groupId = "2222";
     await fs.mkdir(siteDirectory, { recursive: true });
+    if (accountExists) {
+      await fs.mkdir(serviceHome, { recursive: true, mode: 0o700 });
+      await fs.chmod(serviceHome, 0o700);
+    }
     await fs.writeFile(environmentFile, [
       `COMERCIO_HOST='${slug}.vidkar.com'`,
       `PM2_APP_NAME='vidkar-comercio-${slug}-${environmentRequestId.slice(0, 12)}'`,
@@ -933,7 +941,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       "getent() {",
       '  if [ "$1" = "group" ] && [ "$2" = "vidkar-commerce" ]; then printf "vidkar-commerce:x:%s:\\n" "$GROUP_ID"; return 0; fi',
       '  if [ "$1" = "passwd" ]; then',
-      '    if [ "$2" = "$RUN_USER" ] && [ "$ACCOUNT_EXISTS" = "1" ]; then printf "%s:x:996:2222::/tmp/home:/usr/sbin/nologin\\n" "$RUN_USER"; return 0; fi',
+      '    if [ "$2" = "$RUN_USER" ] && [ "$ACCOUNT_EXISTS" = "1" ]; then printf "%s:x:%s:%s::%s:/usr/sbin/nologin\\n" "$RUN_USER" "$SITE_UID" "$GROUP_ID" "$SERVICE_HOME"; return 0; fi',
       '    if [ "$2" = "$SITE_UID" ] && [ "$UID_REUSED" = "1" ]; then printf "reused:x:%s:2222::/tmp/home:/usr/sbin/nologin\\n" "$SITE_UID"; return 0; fi',
       "  fi",
       "  return 2",
@@ -944,11 +952,15 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       '    "%u:$SITE_DIRECTORY") printf "%s\\n" "$SITE_UID" ;;',
       '    "%g:$SITE_DIRECTORY") printf "%s\\n" "$SITE_GROUP" ;;',
       '    "%a:$SITE_DIRECTORY") printf "%s\\n" "$SITE_MODE" ;;',
+      '    "%u:%g:%a:$SITE_DIRECTORY") printf "%s:%s:700\\n" "$SITE_UID" "$GROUP_ID" ;;',
       '    "%u:%g:%a:%h:$ENVIRONMENT_FILE") printf "%s:%s:600:1\\n" "$SITE_UID" "$GROUP_ID" ;;',
+      '    "%u:%g:%a:$SERVICE_HOME") printf "%s:%s:700\\n" "$SITE_UID" "$GROUP_ID" ;;',
       "    *) return 2 ;;",
       "  esac",
       "}",
       'list_service_user_processes() { [ "$ACTIVE_PROCESS" = "1" ] && printf "4321\\n"; return 0; }',
+      "validate_service_home_parent() { :; }",
+      'userdel() { [ "$1" = "--remove" ] && [ "$2" = "$RUN_USER" ] || return 1; ACCOUNT_EXISTS=0; rm -rf -- "$SERVICE_HOME"; }',
       removeOrphanFunction,
       "remove_orphaned_site_directory",
     ].join("\n");
@@ -977,6 +989,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
         SITE_GROUP: siteGroup === "vidkar-commerce" ? groupId : "3333",
         SITE_MODE: mode,
         SITE_UID: siteUid,
+        SERVICE_HOME: serviceHome,
         slug,
         SLUG: slug,
         UID_REUSED: reusedUid ? "1" : "0",
@@ -997,7 +1010,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     for (const invalidProof of [
       { environmentRequestId: "another-request" },
       { activeProcess: true },
-      { accountExists: true },
+      { accountExists: true, requestScopedAccount: false },
       { reusedUid: true },
       { domainMarker: true },
       { mode: "755" },
@@ -1007,6 +1020,19 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       assert.equal(refused.result.status, 1, JSON.stringify(invalidProof));
       assert.equal(refused.exists, true, JSON.stringify(invalidProof));
     }
+
+    const recoveredRequestAccount = await runRecovery({ accountExists: true, requestScopedAccount: true });
+    assert.equal(recoveredRequestAccount.result.status, 0, recoveredRequestAccount.result.stderr);
+    assert.match(recoveredRequestAccount.result.stdout, /ORPHAN_SITE_DIRECTORY_REMOVED/);
+    assert.equal(recoveredRequestAccount.exists, false);
+
+    const activeRequestAccount = await runRecovery({
+      accountExists: true,
+      activeProcess: true,
+      requestScopedAccount: true,
+    });
+    assert.equal(activeRequestAccount.result.status, 1);
+    assert.equal(activeRequestAccount.exists, true);
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }

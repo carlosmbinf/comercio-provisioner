@@ -80,7 +80,7 @@ sudo chmod 0700 /var/lib/vidkar-provisioner/state
 
 Conserva la deploy key privada del repositorio en `/root/.ssh` con permisos restrictivos. No arranques simultáneamente el daemon de PM2 del usuario legacy y el daemon root.
 
-Los despliegues nuevos usan `/opt/vidkar/comercios/<slug>--<requestId>`, home/usuario derivados del `requestId` y una unidad systemd por flujo. No renombres recursos legacy a mano: el helper conserva su layout al leer journals antiguos y solo usa el layout por solicitud cuando `resourceVersion` vale `2`.
+Los despliegues nuevos usan `/opt/vidkar/comercios/<slug>--<requestId>`, home/usuario derivados del `requestId` y una unidad systemd por flujo. Antes de crear una solicitud nueva, el helper bloquea el alta si aún existe cualquier carpeta, home, cuenta o unidad legacy del mismo slug. No renombres recursos legacy a mano: el helper conserva su layout al leer journals antiguos y solo usa el layout por solicitud cuando `resourceVersion` vale `2`.
 
 El worker solo acepta `*.vidkar.com`; no modifica ni solicita acceso a la cuenta de Squarespace. Los registros A se crean manualmente en el panel DNS. Antes de desplegar, el worker rechaza un checkout de `comercio-web` que tenga `.env` versionado: el `.gitignore` evita que se agreguen nuevos, pero no saca automáticamente del índice los que ya estén tracked.
 
