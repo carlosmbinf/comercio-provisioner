@@ -21,7 +21,7 @@ La configuración del worker está centralizada en el `.env` local de este proye
 Variables necesarias:
 
 - `METEOR_DDP_ENDPOINT`: WSS de Meteor; debe terminar en `/websocket`.
-- `PROVISIONER_ID`, `PROVISIONER_TOKEN`, `PROVISIONER_HELPER_HMAC_SECRET` y `PROVISIONER_PUBLIC_IPV4`: identidad, dos secretos aleatorios distintos y la IPv4 del VPS.
+- `PROVISIONER_ID`, `PROVISIONER_TOKEN`, `PROVISIONER_HELPER_HMAC_SECRET` y `PROVISIONER_PUBLIC_IPV4`: identidad estable y única de esta instalación, dos secretos aleatorios distintos y la IPv4 del VPS. Mantén `PROVISIONER_ID` sin cambios entre reinicios; el worker crea aparte un ID de sesión efímero para el fencing.
 - `COMERCIO_REPOSITORY_URL` y `COMERCIO_REPOSITORY_REF`: repositorio autorizado y rama; autentica Git con una deploy key del VPS, nunca con un token incrustado en la URL.
 - `PROVISIONER_DEPLOY_ROOT`, `PROVISIONER_STATE_DIR`, `PROVISIONER_NGINX_SITES_AVAILABLE`, `PROVISIONER_NGINX_SITES_ENABLED` y `PROVISIONER_ACME_WEBROOT`: rutas locales del VPS.
 - `PROVISIONER_CERTBOT_EMAIL`, `PROVISIONER_PORT_START` y `PROVISIONER_PORT_END`.
@@ -65,7 +65,7 @@ El usuario root del provisioner no se usa para ejecutar el código de las tienda
 
 ## Ejecución
 
-Instala dependencias en una ubicación root-owned y ejecuta `npm run check` y `npm test`. Para producción, configura el `.env`, valida el SHA-256 correspondiente en `react-download/settings.json` y arranca `pm2 start ecosystem.config.cjs` como `root`. El PM2 de root es independiente del PM2 que pudiera tener `vidkar-provisioner`: detén el worker anterior antes de migrar para evitar dos procesos y locks concurrentes. Tras arrancar, guarda el proceso con `pm2 save` y configura el inicio del daemon de root con `pm2 startup systemd -u root --hp /root` (aplica el comando que PM2 imprima). No ejecutes el worker contra producción hasta completar la migración de permisos y una prueba en un subdominio de staging.
+Instala dependencias en una ubicación root-owned y ejecuta `npm run check` y `npm test`. Para producción, configura el `.env`, valida el SHA-256 correspondiente en `react-download/settings.json` y arranca `pm2 start ecosystem.config.cjs` como `root`. Despliega primero el backend Meteor con `worker.unregister` y takeover cercado por `PROVISIONER_ID`/IP; workers antiguos no conocen este protocolo y se deben detener antes del corte. El PM2 de root es independiente del PM2 que pudiera tener `vidkar-provisioner`: no mantengas ambos activos. El worker nuevo se desregistra en SIGINT/SIGTERM; si una caída abrupta impide el cierre, la siguiente instancia de la misma instalación y misma IP toma el registro y deja las tareas interrumpidas para recuperación. Tras arrancar, guarda el proceso con `pm2 save` y configura el inicio del daemon de root con `pm2 startup systemd -u root --hp /root` (aplica el comando que PM2 imprima). No ejecutes el worker contra producción hasta completar la migración de permisos y una prueba en un subdominio de staging.
 
 ### Migración del worker a root
 

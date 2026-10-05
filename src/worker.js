@@ -121,6 +121,7 @@ const startWorker = ({
   let activeLeaseLost = false;
   let activeAbortController = null;
   let heartbeatBusy = false;
+  let wakePoll = null;
   let loopPromise;
 
   const callWorker = (method, ...args) => client.call(method, config.token, config.workerId, ...args);
@@ -589,9 +590,20 @@ const startWorker = ({
     }
   };
 
+  const waitForPollOrStop = () => new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      if (wakePoll === finish) wakePoll = null;
+      resolve();
+    };
+    const timer = setTimeout(finish, config.pollIntervalMs);
+    wakePoll = finish;
+  });
+
   const runLoop = async () => {
     const processLock = await taskLock.acquire("worker-process");
     let heartbeatTimer;
+    let workerRegistered = false;
     try {
       await client.connect();
       await client.call(
@@ -600,7 +612,9 @@ const startWorker = ({
         config.workerId,
         config.publicIpv4,
         true,
+        config.workerIdentity || config.workerId,
       );
+      workerRegistered = true;
       rootLogger.info("WORKER registrado; esperando tareas con DNS verificado");
 
       heartbeatTimer = setInterval(sendHeartbeat, Math.min(config.heartbeatIntervalMs, 30000));
@@ -608,8 +622,9 @@ const startWorker = ({
       while (!stopping) {
         try {
           const task = await callWorker("comercio.provisioning.worker.claimNext");
+          if (stopping) break;
           if (!task) {
-            await sleep(config.pollIntervalMs);
+            await waitForPollOrStop();
             continue;
           }
           if (!task.leaseToken) throw new Error("El backend no asignó un fencing token al trabajo.");
@@ -623,6 +638,19 @@ const startWorker = ({
       }
     } finally {
       clearInterval(heartbeatTimer);
+      if (workerRegistered) {
+        try {
+          await callWorker("comercio.provisioning.worker.unregister");
+          rootLogger.info("WORKER desconectado de VIDKAR; la siguiente instancia podrá registrarse inmediatamente");
+        } catch (error) {
+          rootLogger.warn(`WORKER UNREGISTER FAIL reason=${sanitizeMessage(error?.message || "error de conexión")}`);
+        }
+      }
+      try {
+        await client.disconnect?.();
+      } catch (_error) {
+        rootLogger.warn("WORKER DDP disconnect falló; la siguiente instancia podrá tomar el registro por fencing");
+      }
       await processLock.release();
     }
   };
@@ -631,7 +659,10 @@ const startWorker = ({
   loopPromise.catch(() => {});
   return {
     done: loopPromise,
-    stop: () => { stopping = true; },
+    stop: () => {
+      stopping = true;
+      wakePoll?.();
+    },
   };
 };
 

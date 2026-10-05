@@ -7,6 +7,7 @@ const {
   createFencedClient,
   runCloseWithAutomaticRetries,
   shouldFinishRecoveredDeployment,
+  startWorker,
 } = require("../src/worker");
 
 test("un retry manual de rollback nunca finaliza un journal de deployment activo", () => {
@@ -228,4 +229,57 @@ test("el cierre no reintenta fallos bloqueados y limita los intentos si persiste
   assert.equal(attempts, 3);
   assert.equal(persistent.closeSucceeded, false);
   assert.equal(persistent.retryable, true);
+});
+
+test("al detener PM2 el worker se desregistra, desconecta DDP y libera el lock local", async () => {
+  const calls = [];
+  let resolveRegistered;
+  let resolveFirstClaim;
+  const registered = new Promise((resolve) => { resolveRegistered = resolve; });
+  const firstClaim = new Promise((resolve) => { resolveFirstClaim = resolve; });
+  const worker = startWorker({
+    client: {
+      connect: async () => {},
+      disconnect: async () => { calls.push("disconnect"); },
+      call: async (method, ...args) => {
+        calls.push([method, ...args]);
+        if (method === "comercio.provisioning.worker.register") resolveRegistered();
+        if (method === "comercio.provisioning.worker.claimNext") {
+          resolveFirstClaim();
+          return null;
+        }
+        return { success: true };
+      },
+    },
+    config: {
+      heartbeatIntervalMs: 60000,
+      pollIntervalMs: 60000,
+      publicIpv4: "192.0.2.44",
+      token: "worker-token",
+      workerId: "worker-session-123",
+      workerIdentity: "provisioner-install-1",
+    },
+    logger: { error() {}, info() {}, warn() {} },
+    runner: {},
+    stateStore: {},
+    taskLock: {
+      acquire: async () => ({ release: async () => { calls.push("release-lock"); } }),
+    },
+  });
+
+  await registered;
+  await firstClaim;
+  worker.stop();
+  await worker.done;
+
+  const methodCalls = calls.filter(Array.isArray);
+  assert.deepEqual(methodCalls.map(([method]) => method), [
+    "comercio.provisioning.worker.register",
+    "comercio.provisioning.worker.claimNext",
+    "comercio.provisioning.worker.unregister",
+  ]);
+  assert.deepEqual(methodCalls[0].slice(1), [
+    "worker-token", "worker-session-123", "192.0.2.44", true, "provisioner-install-1",
+  ]);
+  assert.ok(calls.indexOf("disconnect") < calls.indexOf("release-lock"));
 });

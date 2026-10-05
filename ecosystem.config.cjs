@@ -8,6 +8,7 @@ module.exports = {
       cwd: __dirname,
       interpreter: process.execPath,
       autorestart: true,
+      kill_timeout: 60000,
       max_memory_restart: "512M",
       restart_delay: 3000,
       env: { NODE_ENV: process.env.NODE_ENV || "production" },

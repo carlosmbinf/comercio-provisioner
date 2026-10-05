@@ -64,6 +64,11 @@ const createMeteorClient = ({ endpoint, connectTimeoutMs, callTimeoutMs = 15000,
     }
   };
 
+  const disconnect = async () => {
+    connectPromise = null;
+    await server.disconnect();
+  };
+
   server.on("disconnected", () => {
     connectPromise = null;
     logger.warn("[comercio-provisioner] Conexión DDP interrumpida; se reintentará.");
@@ -72,7 +77,7 @@ const createMeteorClient = ({ endpoint, connectTimeoutMs, callTimeoutMs = 15000,
     logger.warn("[comercio-provisioner] Error en transporte DDP.");
   });
 
-  return { call, connect, server };
+  return { call, connect, disconnect, server };
 };
 
 module.exports = { createMeteorClient };

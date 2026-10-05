@@ -15,7 +15,8 @@ let worker;
 
 const start = async () => {
   const config = loadConfig(process.env);
-  config.workerId = createWorkerInstanceId({ configuredId: config.workerId });
+  config.workerIdentity = config.workerId;
+  config.workerId = createWorkerInstanceId({ configuredId: config.workerIdentity });
   delete process.env.PROVISIONER_TOKEN;
   delete process.env.PROVISIONER_HELPER_HMAC_SECRET;
   const client = createMeteorClient({
