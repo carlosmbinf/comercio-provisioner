@@ -125,6 +125,29 @@ service_unit_for() {
   fi
 }
 
+disable_managed_service_unit() {
+  managed_unit_file=$1
+  managed_unit_name=${managed_unit_file##*/}
+  systemctl daemon-reload \
+    || fail_retryable "Could not reload the systemd unit registry before disabling the commerce unit."
+  managed_unit_state="$(systemctl is-enabled "$managed_unit_name" 2>&1 || true)"
+  case "$managed_unit_state" in
+    disabled)
+      return 0
+      ;;
+    enabled|enabled-runtime|linked|linked-runtime)
+      managed_disable_output="$(systemctl disable "$managed_unit_name" 2>&1)" \
+        || fail_retryable "Could not disable $managed_unit_name: $managed_disable_output"
+      managed_unit_state="$(systemctl is-enabled "$managed_unit_name" 2>&1 || true)"
+      [ "$managed_unit_state" = "disabled" ] \
+        || fail_retryable "Systemd still reports $managed_unit_name as $managed_unit_state after disable."
+      ;;
+    *)
+      fail_retryable "Could not verify systemd state for $managed_unit_name: $managed_unit_state"
+      ;;
+  esac
+}
+
 certificate_name_for_request() {
   slug=$1
   request_id=$2
@@ -662,6 +685,7 @@ remove_nginx() {
   enabled_link="$enabled_dir/$hostname.conf"
   marker="# Managed by VIDKAR commerce provisioner; request $request_id"
   service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
+  service_unit_name=${service_unit##*/}
 
   permit_file="$HELPER_STATE_DIR/$request_id"
   if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
@@ -679,10 +703,10 @@ remove_nginx() {
   if [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
     [ -f "$service_unit" ] && [ ! -L "$service_unit" ] || fail "Refusing to remove an unexpected systemd unit path."
     grep -Fqx "# Managed by VIDKAR commerce provisioner; request $request_id" "$service_unit" || fail "Refusing to remove a systemd unit not owned by this request."
-    if systemctl is-active --quiet "vidkar-commerce-$slug.service"; then
-      systemctl stop "vidkar-commerce-$slug.service" || fail_retryable "Could not stop this store's systemd unit."
+    if systemctl is-active --quiet "$service_unit_name"; then
+      systemctl stop "$service_unit_name" || fail_retryable "Could not stop this store's systemd unit."
     fi
-    systemctl disable "vidkar-commerce-$slug.service" >/dev/null 2>&1 || fail_retryable "Could not disable this store's systemd unit."
+    disable_managed_service_unit "$service_unit"
     rm -f "$service_unit" || fail_retryable "Could not remove this store's systemd unit."
   fi
 
@@ -1098,7 +1122,7 @@ enable_pm2() {
   service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
   marker="# Managed by VIDKAR commerce provisioner; request $request_id"
   [ -f "$service_unit" ] && grep -Fqx "$marker" "$service_unit" || fail "Systemd unit is not owned by this request."
-  systemctl enable "$service_unit"
+  systemctl enable "${service_unit##*/}"
 }
 
 write_site_environment() {

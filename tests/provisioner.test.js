@@ -583,6 +583,55 @@ test("el helper root rechaza operaciones y argumentos desconocidos antes de toca
   assert.match(unsupported.stderr, /Privileged helper key is not installed/);
 });
 
+test("deshabilitar una unidad systemd es idempotente y conserva el error real", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const disableFunction = helper.match(/^disable_managed_service_unit\(\) \{\n[\s\S]*?^\}/m)?.[0];
+  assert.ok(disableFunction, "debe existir la rutina de disable idempotente");
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-systemd-disable-"));
+  const run = async (mode) => {
+    const stateFile = path.join(root, `${mode}.disabled`);
+    const callLog = path.join(root, `${mode}.calls`);
+    if (mode === "already-disabled") await fs.writeFile(stateFile, "disabled\n");
+    const script = [
+      disableFunction,
+      'fail_retryable() { printf "AUTO_RETRY: %s\\n" "$*" >&2; exit 75; }',
+      "systemctl() {",
+      '  case "$1" in',
+      '    daemon-reload) return 0 ;;',
+      '    is-enabled) if [ -f "$STATE_FILE" ]; then printf "disabled\\n"; else printf "enabled\\n"; fi ;;',
+      '    disable) printf "%s\\n" "$1 $2" >> "$CALL_LOG"; if [ "$MODE" = "fail" ]; then printf "permission denied\\n" >&2; return 1; fi; : > "$STATE_FILE"; printf "Removed\\n" ;;',
+      '    *) return 2 ;;',
+      "  esac",
+      "}",
+      'disable_managed_service_unit "/etc/systemd/system/vidkar-commerce-test.service"',
+    ].join("\n");
+    const result = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, CALL_LOG: callLog, MODE: mode, STATE_FILE: stateFile },
+    });
+    const calls = await fs.readFile(callLog, "utf8").catch(() => "");
+    return { calls, result };
+  };
+
+  try {
+    const alreadyDisabled = await run("already-disabled");
+    assert.equal(alreadyDisabled.result.status, 0, alreadyDisabled.result.stderr);
+    assert.equal(alreadyDisabled.calls, "");
+
+    const disabledNow = await run("enabled");
+    assert.equal(disabledNow.result.status, 0, disabledNow.result.stderr);
+    assert.equal(disabledNow.calls, "disable vidkar-commerce-test.service\n");
+
+    const failed = await run("fail");
+    assert.equal(failed.result.status, 75);
+    assert.match(failed.result.stderr, /Could not disable vidkar-commerce-test\.service: permission denied/);
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
 test("el helper limita Certbot al lineage de una solicitud y preserva certificados compartidos o referenciados", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");
