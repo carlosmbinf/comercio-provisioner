@@ -683,13 +683,23 @@ test("el helper exige COMERCIO_HOST igual al dominio solicitado", async () => {
   assert.doesNotMatch(helper, /wc -l < "\$decoded_file"/);
 });
 
-test("el .env de cada tienda usa el grupo vidkar-commerce creado por prepare-site", async () => {
+test("el .env se instala con file descriptors sin seguir symlinks controlados por el comercio", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");
+  const writer = helper.match(/python3 - "\$site_directory" "\$run_user" "\$decoded_file" <<'PY'\n([\s\S]*?)\nPY/);
 
   assert.match(helper, /useradd .*--gid vidkar-commerce "\$run_user"/);
-  assert.match(helper, /chown "\$run_user:vidkar-commerce" "\$environment_file"/);
-  assert.doesNotMatch(helper, /chown "\$run_user:\$run_user" "\$environment_file"/);
+  assert.match(helper, /mktemp "\$HELPER_STATE_DIR\/\.environment\.XXXXXX"/);
+  assert.ok(writer, "debe existir el escritor seguro del .env");
+  assert.match(writer[1], /os\.O_EXCL \| os\.O_NOFOLLOW/);
+  assert.match(writer[1], /os\.fchown\(environment_fd, expected_uid, expected_gid\)/);
+  assert.match(writer[1], /os\.fchmod\(environment_fd, 0o600\)/);
+  assert.doesNotMatch(helper, /chown "\$run_user:vidkar-commerce" "\$environment_file"/);
+  const parsed = spawnSync("python3", ["-c", "import ast, sys; ast.parse(sys.stdin.read())"], {
+    encoding: "utf8",
+    input: writer[1],
+  });
+  assert.equal(parsed.status, 0, parsed.stderr);
 });
 
 test("el helper restaura un permiso perdido solo desde el registro root-owned del mismo dominio y requestId", async () => {
@@ -779,6 +789,136 @@ test("el helper restaura un permiso perdido solo desde el registro root-owned de
     }
 
     assert.match(helper, /Site resources exist without a verifiable root-owned request registration/);
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
+test("el helper elimina solo un directorio huérfano ligado al slug y requestId por su .env", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const extractFunction = (name) => {
+    const match = helper.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, "m"));
+    assert.ok(match, `debe existir la función ${name}`);
+    return match[0];
+  };
+  const validUidFunction = extractFunction("valid_service_uid");
+  const removeOrphanFunction = extractFunction("remove_orphaned_site_directory");
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-orphan-site-recovery-"));
+  const requestId = "roM9TFGwhWfHy5Mrg";
+  const slug = "tienda";
+  let scenario = 0;
+
+  const runRecovery = async ({
+    activeProcess = false,
+    accountExists = false,
+    domainMarker = false,
+    environmentRequestId = requestId,
+    mode = "700",
+    reusedUid = false,
+    siteGroup = "vidkar-commerce",
+  } = {}) => {
+    const scenarioRoot = path.join(root, `case-${scenario}`);
+    scenario += 1;
+    const deployRoot = path.join(scenarioRoot, "deploy");
+    const siteDirectory = path.join(deployRoot, slug);
+    const environmentFile = path.join(siteDirectory, ".env");
+    const serviceHome = path.join(scenarioRoot, "home", slug);
+    const stateDirectory = path.join(scenarioRoot, "state");
+    const requestRunUser = "vcommerce-123456789abc";
+    const siteUid = "996";
+    const groupId = "2222";
+    await fs.mkdir(siteDirectory, { recursive: true });
+    await fs.writeFile(environmentFile, [
+      `COMERCIO_HOST='${slug}.vidkar.com'`,
+      `PM2_APP_NAME='vidkar-comercio-${slug}-${environmentRequestId.slice(0, 12)}'`,
+      "",
+    ].join("\n"), { mode: 0o600 });
+    if (domainMarker) {
+      await fs.mkdir(stateDirectory, { recursive: true });
+      await fs.writeFile(path.join(stateDirectory, `domain-${slug}`), "another-request\n");
+    }
+
+    const script = [
+      validUidFunction,
+      "validate_deploy_root() { :; }",
+      "getent() {",
+      '  if [ "$1" = "group" ] && [ "$2" = "vidkar-commerce" ]; then printf "vidkar-commerce:x:%s:\\n" "$GROUP_ID"; return 0; fi',
+      '  if [ "$1" = "passwd" ]; then',
+      '    if [ "$2" = "$RUN_USER" ] && [ "$ACCOUNT_EXISTS" = "1" ]; then printf "%s:x:996:2222::/tmp/home:/usr/sbin/nologin\\n" "$RUN_USER"; return 0; fi',
+      '    if [ "$2" = "$SITE_UID" ] && [ "$UID_REUSED" = "1" ]; then printf "reused:x:%s:2222::/tmp/home:/usr/sbin/nologin\\n" "$SITE_UID"; return 0; fi',
+      "  fi",
+      "  return 2",
+      "}",
+      "stat() {",
+      '  [ "$1" = "-c" ] || return 2',
+      '  case "$2:$3" in',
+      '    "%u:$SITE_DIRECTORY") printf "%s\\n" "$SITE_UID" ;;',
+      '    "%g:$SITE_DIRECTORY") printf "%s\\n" "$SITE_GROUP" ;;',
+      '    "%a:$SITE_DIRECTORY") printf "%s\\n" "$SITE_MODE" ;;',
+      '    "%u:%g:%a:%h:$ENVIRONMENT_FILE") printf "%s:%s:600:1\\n" "$SITE_UID" "$GROUP_ID" ;;',
+      "    *) return 2 ;;",
+      "  esac",
+      "}",
+      'list_service_user_processes() { [ "$ACTIVE_PROCESS" = "1" ] && printf "4321\\n"; return 0; }',
+      removeOrphanFunction,
+      "remove_orphaned_site_directory",
+    ].join("\n");
+    const result = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ACCOUNT_EXISTS: accountExists ? "1" : "0",
+        ACTIVE_PROCESS: activeProcess ? "1" : "0",
+        certificate_marker: path.join(stateDirectory, `certificate-${requestId}`),
+        config_file: path.join(scenarioRoot, "nginx", `${slug}.conf`),
+        DEPLOY_ROOT: deployRoot,
+        domain_file: path.join(stateDirectory, `domain-${slug}`),
+        enabled_link: path.join(scenarioRoot, "nginx-enabled", `${slug}.conf`),
+        ENVIRONMENT_FILE: environmentFile,
+        GROUP_ID: groupId,
+        orphan_site_directory: siteDirectory,
+        permit_file: path.join(stateDirectory, requestId),
+        request_id: requestId,
+        RUN_USER: requestRunUser,
+        run_user: requestRunUser,
+        service_home: serviceHome,
+        service_unit: path.join(scenarioRoot, "systemd", `vidkar-commerce-${slug}.service`),
+        site_directory: siteDirectory,
+        SITE_DIRECTORY: siteDirectory,
+        SITE_GROUP: siteGroup === "vidkar-commerce" ? groupId : "3333",
+        SITE_MODE: mode,
+        SITE_UID: siteUid,
+        slug,
+        SLUG: slug,
+        UID_REUSED: reusedUid ? "1" : "0",
+      },
+    });
+    return {
+      exists: await fs.stat(siteDirectory).then(() => true, () => false),
+      result,
+    };
+  };
+
+  try {
+    const removed = await runRecovery();
+    assert.equal(removed.result.status, 0, removed.result.stderr);
+    assert.match(removed.result.stdout, /ORPHAN_SITE_DIRECTORY_REMOVED/);
+    assert.equal(removed.exists, false);
+
+    for (const invalidProof of [
+      { environmentRequestId: "another-request" },
+      { activeProcess: true },
+      { accountExists: true },
+      { reusedUid: true },
+      { domainMarker: true },
+      { mode: "755" },
+      { siteGroup: "other-group" },
+    ]) {
+      const refused = await runRecovery(invalidProof);
+      assert.equal(refused.result.status, 1, JSON.stringify(invalidProof));
+      assert.equal(refused.exists, true, JSON.stringify(invalidProof));
+    }
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }

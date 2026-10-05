@@ -210,6 +210,46 @@ restore_request_registration_from_domain() {
   printf '%s\n' "REQUEST_REGISTRATION_RESTORED"
 }
 
+remove_orphaned_site_directory() {
+  [ "$site_directory" = "$DEPLOY_ROOT/$slug" ] || return 1
+  validate_deploy_root
+  [ ! -e "$permit_file" ] && [ ! -L "$permit_file" ] || return 1
+  [ ! -e "$domain_file" ] && [ ! -L "$domain_file" ] || return 1
+  [ ! -e "$certificate_marker" ] && [ ! -L "$certificate_marker" ] || return 1
+  [ ! -e "$service_home" ] && [ ! -L "$service_home" ] || return 1
+  [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] || return 1
+  [ ! -e "$config_file" ] && [ ! -L "$config_file" ] || return 1
+  [ ! -e "$enabled_link" ] && [ ! -L "$enabled_link" ] || return 1
+  if getent passwd "$run_user" >/dev/null; then
+    return 1
+  fi
+  [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || return 1
+
+  orphan_site_uid="$(stat -c '%u' "$site_directory")"
+  orphan_site_gid="$(stat -c '%g' "$site_directory")"
+  valid_service_uid "$orphan_site_uid" || return 1
+  if getent passwd "$orphan_site_uid" >/dev/null; then
+    return 1
+  fi
+  commerce_group="$(getent group vidkar-commerce 2>/dev/null || true)"
+  commerce_gid="$(printf '%s' "$commerce_group" | cut -d: -f3)"
+  case "$commerce_gid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$orphan_site_gid" = "$commerce_gid" ] || return 1
+  [ "$(stat -c '%a' "$site_directory")" = "700" ] || return 1
+
+  orphan_environment="$site_directory/.env"
+  [ -f "$orphan_environment" ] && [ ! -L "$orphan_environment" ] || return 1
+  [ "$(stat -c '%u:%g:%a:%h' "$orphan_environment")" = "$orphan_site_uid:$commerce_gid:600:1" ] || return 1
+  expected_pm2_name="vidkar-comercio-$slug-$(printf '%s' "$request_id" | cut -c1-12)"
+  [ "$(grep -Fxc "COMERCIO_HOST='$slug.vidkar.com'" "$orphan_environment")" -eq 1 ] || return 1
+  [ "$(grep -Fxc "PM2_APP_NAME='$expected_pm2_name'" "$orphan_environment")" -eq 1 ] || return 1
+
+  orphan_processes="$(list_service_user_processes "$orphan_site_uid")" || return 1
+  [ -z "$orphan_processes" ] || return 1
+  rm -rf -- "$site_directory" || fail_retryable "Could not remove the verified orphaned commerce site directory."
+  printf '%s\n' "ORPHAN_SITE_DIRECTORY_REMOVED"
+}
+
 valid_service_uid() {
   case "$1" in ''|*[!0-9]*) return 1 ;; esac
   [ "$1" -gt 0 ]
@@ -739,8 +779,13 @@ remove_site() {
     if [ -e "$site_directory" ] || [ -L "$site_directory" ] \
       || [ -e "$service_home" ] || [ -L "$service_home" ] \
       || getent passwd "$run_user" >/dev/null; then
-      restore_request_registration_from_domain "$request_id" "$slug" "$run_user" \
-        || fail "Site resources exist without a verifiable root-owned request registration; manual review is required."
+      if restore_request_registration_from_domain "$request_id" "$slug" "$run_user"; then
+        :
+      elif remove_orphaned_site_directory; then
+        return 0
+      else
+        fail "Site resources exist without a verifiable root-owned request registration or matching orphan-site evidence; manual review is required."
+      fi
     else
       if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
         fail "Certificate ownership remains without a root-owned request registration; manual review is required."
@@ -935,12 +980,13 @@ write_site_environment() {
   [ "${#environment_base64}" -le 32768 ] || fail "Environment payload is too large."
 
   site_directory="$DEPLOY_ROOT/$slug"
+  validate_deploy_root
   [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || fail "Commerce site directory is missing or is a symlink."
   [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory is not owned by the registered service user."
   environment_file="$site_directory/.env"
   [ ! -e "$environment_file" ] && [ ! -L "$environment_file" ] || fail "Refusing to overwrite an existing commerce .env."
 
-  decoded_file="$(mktemp "$site_directory/.env.XXXXXX")"
+  decoded_file="$(mktemp "$HELPER_STATE_DIR/.environment.XXXXXX")"
   trap 'rm -f "$decoded_file"' EXIT HUP INT TERM
   printf '%s' "$environment_base64" | base64 --decode > "$decoded_file" || fail "Environment payload is not valid base64."
 
@@ -958,10 +1004,79 @@ write_site_environment() {
   [ "$(grep -Fxc "HOST='127.0.0.1'" "$decoded_file")" -eq 1 ] || fail "Environment HOST is not allowed."
   [ "$(grep -Fxc "NODE_ENV='production'" "$decoded_file")" -eq 1 ] || fail "Environment NODE_ENV is not allowed."
   [ "$(grep -Fxc "COMERCIO_HOST='$slug.vidkar.com'" "$decoded_file")" -eq 1 ] || fail "Environment commerce hostname does not match the request."
-  mv "$decoded_file" "$environment_file"
-  chown "$run_user:vidkar-commerce" "$environment_file"
-  chmod 0600 "$environment_file"
+  python3 - "$site_directory" "$run_user" "$decoded_file" <<'PY'
+import grp
+import os
+import pwd
+import shutil
+import stat
+import sys
+
+site_directory, run_user, decoded_file = sys.argv[1:]
+directory_fd = -1
+environment_fd = -1
+environment_identity = None
+
+try:
+    directory_fd = os.open(
+        site_directory,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    directory_info = os.fstat(directory_fd)
+    expected_uid = pwd.getpwnam(run_user).pw_uid
+    expected_gid = grp.getgrnam("vidkar-commerce").gr_gid
+    if (directory_info.st_uid != expected_uid
+            or directory_info.st_gid != expected_gid
+            or stat.S_IMODE(directory_info.st_mode) != 0o700):
+        raise RuntimeError("commerce directory ownership or mode changed")
+
+    environment_fd = os.open(
+        ".env",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    environment_info = os.fstat(environment_fd)
+    if not stat.S_ISREG(environment_info.st_mode) or environment_info.st_nlink != 1:
+        raise RuntimeError("environment path is not a new regular file")
+    environment_identity = (environment_info.st_dev, environment_info.st_ino)
+
+    with open(decoded_file, "rb") as source:
+        with os.fdopen(os.dup(environment_fd), "wb") as destination:
+            shutil.copyfileobj(source, destination)
+            destination.flush()
+            os.fsync(destination.fileno())
+
+    os.fchown(environment_fd, expected_uid, expected_gid)
+    os.fchmod(environment_fd, 0o600)
+    os.fsync(environment_fd)
+    installed_info = os.stat(".env", dir_fd=directory_fd, follow_symlinks=False)
+    if ((installed_info.st_dev, installed_info.st_ino) != environment_identity
+            or not stat.S_ISREG(installed_info.st_mode)
+            or installed_info.st_uid != expected_uid
+            or installed_info.st_gid != expected_gid
+            or stat.S_IMODE(installed_info.st_mode) != 0o600
+            or installed_info.st_nlink != 1):
+        raise RuntimeError("environment path changed during secure installation")
+    os.fsync(directory_fd)
+except Exception:
+    if directory_fd >= 0 and environment_identity is not None:
+        try:
+            current_info = os.stat(".env", dir_fd=directory_fd, follow_symlinks=False)
+            if (current_info.st_dev, current_info.st_ino) == environment_identity:
+                os.unlink(".env", dir_fd=directory_fd)
+        except OSError:
+            pass
+    print("Could not safely install the commerce environment file.", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    if environment_fd >= 0:
+        os.close(environment_fd)
+    if directory_fd >= 0:
+        os.close(directory_fd)
+PY
   trap - EXIT HUP INT TERM
+  rm -f "$decoded_file"
 }
 
 service_directory() {
