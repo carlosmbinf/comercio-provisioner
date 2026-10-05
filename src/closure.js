@@ -1,7 +1,7 @@
 const path = require("node:path");
 const { certificateNameForRequest, isPortAvailable } = require("./deployment");
 const { createPrivilegedHelperRunner } = require("./privilegedHelper");
-const { createServiceUsername } = require("./serviceUser");
+const { createLegacyServiceUsername, createServiceUsername } = require("./serviceUser");
 
 const safeRequestId = (value) => typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 const safeSlug = (value) => typeof value === "string" && /^[a-z0-9](?:[a-z0-9-]{1,38}[a-z0-9])?$/.test(value);
@@ -35,12 +35,18 @@ const validateCloseTarget = ({ config, journal, request }) => {
     throw closeBlockedError("El journal no coincide exactamente con la tienda que se solicitó cerrar.");
   }
 
-  const expectedSiteDirectory = path.resolve(config.deployRoot, request.slug);
+  const legacyResources = journal.resourceVersion !== 2;
+  const expectedSiteDirectory = path.resolve(
+    config.deployRoot,
+    legacyResources ? request.slug : `${request.slug}--${request.requestId}`,
+  );
   const expectedAvailablePath = path.resolve(config.nginxSitesAvailable, `${request.hostname}.conf`);
   const expectedEnabledPath = path.resolve(config.nginxSitesEnabled, `${request.hostname}.conf`);
   const expectedPm2Name = `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`;
   const expectedCertificateName = certificateNameForRequest(request.slug, request.requestId);
-  const expectedRunUser = createServiceUsername(request.slug);
+  const expectedRunUser = legacyResources
+    ? createLegacyServiceUsername(request.slug)
+    : createServiceUsername(request.slug, request.requestId);
   if (path.resolve(journal.siteDirectory || "") !== expectedSiteDirectory
     || path.resolve(journal.nginxAvailablePath || "") !== expectedAvailablePath
     || path.resolve(journal.nginxEnabledPath || "") !== expectedEnabledPath

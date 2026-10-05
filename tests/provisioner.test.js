@@ -20,7 +20,7 @@ const { dnsPointsToVps, resolveA } = require("../src/dns");
 const { renderHttpNginxConfig, renderHttpsNginxConfig } = require("../src/nginxConfig");
 const { createPrivilegedHelperRunner, signOperation } = require("../src/privilegedHelper");
 const { rollbackDeployment } = require("../src/rollback");
-const { createServiceUsername } = require("../src/serviceUser");
+const { createLegacyServiceUsername, createServiceUsername } = require("../src/serviceUser");
 const { createStateStore, isSafeRequestId } = require("../src/stateStore");
 
 const validEnvironment = (root) => ({
@@ -202,7 +202,7 @@ test("el cierre elimina solo recursos ligados al journal y conserva certificados
     pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
     port: 5210,
     requestId: request.requestId,
-    runUser: createServiceUsername(request.slug),
+    runUser: createLegacyServiceUsername(request.slug),
     siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
     siteDirectoryCreated: true,
     slug: request.slug,
@@ -272,7 +272,7 @@ test("el reintento de cierre omite pasos completados y repite solo certificado y
       pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
       port: 5210,
       requestId: request.requestId,
-      runUser: createServiceUsername(request.slug),
+      runUser: createLegacyServiceUsername(request.slug),
       siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
       siteDirectoryCreated: true,
       slug: request.slug,
@@ -331,7 +331,7 @@ test("un cierre reanudado conserva la advertencia de un certificado ya preservad
       pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
       port: 5213,
       requestId: request.requestId,
-      runUser: createServiceUsername(request.slug),
+      runUser: createLegacyServiceUsername(request.slug),
       siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
       siteDirectoryCreated: true,
       slug: request.slug,
@@ -376,7 +376,7 @@ test("el cierre bloquea Nginx, certificado y archivos si PM2 no libera el puerto
       pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
       port: 5211,
       requestId: request.requestId,
-      runUser: createServiceUsername(request.slug),
+      runUser: createLegacyServiceUsername(request.slug),
       siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
       slug: request.slug,
       state: "ACTIVE",
@@ -430,7 +430,7 @@ test("rechaza un journal que apunta a otra tienda antes de invocar el helper roo
       pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
       port: 5212,
       requestId: request.requestId,
-      runUser: createServiceUsername(request.slug),
+      runUser: createLegacyServiceUsername(request.slug),
       siteDirectory: `/opt/vidkar/comercios/${request.slug}`,
       slug: request.slug,
       state: "ACTIVE",
@@ -440,6 +440,49 @@ test("rechaza un journal que apunta a otra tienda antes de invocar el helper roo
     stateStore: { write: async () => {} },
   }), /rutas o identidades distintas/);
   assert.equal(calls.length, 0);
+});
+
+test("cierra un journal resourceVersion 2 solo con identidad y ruta por requestId", async () => {
+  const calls = [];
+  const request = { hostname: "tienda-norte.vidkar.com", requestId: "request-close-v2", slug: "tienda-norte" };
+  const siteDirectory = `/opt/vidkar/comercios/${request.slug}--${request.requestId}`;
+  const result = await closeDeployment({
+    config: {
+      acmeWebroot: "/var/www/letsencrypt",
+      commandTimeoutMs: 5000,
+      deployRoot: "/opt/vidkar/comercios",
+      helperHmacSecret: "helper-secret-" + "h".repeat(48),
+      nginxSitesAvailable: "/etc/nginx/sites-available",
+      nginxSitesEnabled: "/etc/nginx/sites-enabled",
+      portRangeEnd: 5899,
+      portRangeStart: 5200,
+      privilegedHelper: "/usr/local/sbin/vidkar-commerce-helper",
+    },
+    journal: {
+      certificateName: certificateNameForRequest(request.slug, request.requestId),
+      hostname: request.hostname,
+      nginxAvailablePath: `/etc/nginx/sites-available/${request.hostname}.conf`,
+      nginxEnabledPath: `/etc/nginx/sites-enabled/${request.hostname}.conf`,
+      pm2Name: `vidkar-comercio-${request.slug}-${request.requestId.slice(0, 12)}`,
+      port: 5210,
+      requestId: request.requestId,
+      resourceVersion: 2,
+      runUser: createServiceUsername(request.slug, request.requestId),
+      siteDirectory,
+      siteDirectoryCreated: true,
+      slug: request.slug,
+      state: "ACTIVE",
+    },
+    logger: { error() {}, info() {}, warn() {} },
+    onCloseStep: async () => {},
+    portProbe: async () => true,
+    request,
+    runner: { runCommand: async (_command, args) => { calls.push(args); return {}; } },
+    stateStore: { write: async () => {} },
+  });
+
+  assert.equal(result.closeSucceeded, true);
+  assert.deepEqual(calls.map((args) => args[4]), ["pm2-delete", "remove-nginx", "remove-certificate", "remove-site"]);
 });
 
 test("el worker se detiene antes de clonar si la resolución DNS no coincide", async () => {
@@ -702,6 +745,43 @@ test("el .env se instala con file descriptors sin seguir symlinks controlados po
   assert.equal(parsed.status, 0, parsed.stderr);
 });
 
+test("el helper deriva cuenta, carpeta, home y unidad nuevas desde requestId y conserva layout legacy", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const extractFunction = (name) => {
+    const match = helper.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, "m"));
+    assert.ok(match, `debe existir la función ${name}`);
+    return match[0];
+  };
+  const script = [
+    extractFunction("service_user_for_slug"),
+    extractFunction("service_user_for_request"),
+    extractFunction("validate_service_user"),
+    extractFunction("service_layout_for"),
+    extractFunction("site_directory_for"),
+    extractFunction("service_home_for"),
+    extractFunction("service_unit_for"),
+    'fail() { printf "%s\\n" "$1" >&2; exit 1; }',
+    'DEPLOY_ROOT="/opt/vidkar/comercios"',
+    'legacy_user="$(service_user_for_slug tienda)"',
+    'flow_a_user="$(service_user_for_request tienda request-a)"',
+    'flow_b_user="$(service_user_for_request tienda request-b)"',
+    '[ "$flow_a_user" != "$flow_b_user" ] || exit 2',
+    '[ "$(site_directory_for tienda request-a "$flow_a_user")" = "/opt/vidkar/comercios/tienda--request-a" ] || exit 3',
+    '[ "$(service_home_for tienda request-a "$flow_a_user")" = "/var/lib/vidkar-commerce/$flow_a_user" ] || exit 4',
+    '[ "$(service_unit_for tienda request-a "$flow_a_user")" = "/etc/systemd/system/vidkar-commerce-$flow_a_user.service" ] || exit 5',
+    '[ "$(site_directory_for tienda request-b "$flow_b_user")" != "$(site_directory_for tienda request-a "$flow_a_user")" ] || exit 6',
+    '[ "$(site_directory_for tienda request-a "$legacy_user")" = "/opt/vidkar/comercios/tienda" ] || exit 7',
+    '[ "$(service_home_for tienda request-a "$legacy_user")" = "/var/lib/vidkar-commerce/tienda" ] || exit 8',
+    '[ "$(service_unit_for tienda request-a "$legacy_user")" = "/etc/systemd/system/vidkar-commerce-tienda.service" ] || exit 9',
+    'validate_service_user tienda request-a "$flow_a_user"',
+    'validate_service_user tienda request-a "$legacy_user"',
+  ].join("\n");
+  const result = spawnSync("sh", ["-c", script], { encoding: "utf8" });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test("el helper restaura un permiso perdido solo desde el registro root-owned del mismo dominio y requestId", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");
@@ -802,6 +882,10 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     assert.ok(match, `debe existir la función ${name}`);
     return match[0];
   };
+  const serviceUserForSlug = extractFunction("service_user_for_slug");
+  const serviceUserForRequest = extractFunction("service_user_for_request");
+  const serviceLayoutFor = extractFunction("service_layout_for");
+  const siteDirectoryFor = extractFunction("site_directory_for");
   const validUidFunction = extractFunction("valid_service_uid");
   const removeOrphanFunction = extractFunction("remove_orphaned_site_directory");
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-orphan-site-recovery-"));
@@ -825,7 +909,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     const environmentFile = path.join(siteDirectory, ".env");
     const serviceHome = path.join(scenarioRoot, "home", slug);
     const stateDirectory = path.join(scenarioRoot, "state");
-    const requestRunUser = "vcommerce-123456789abc";
+    const requestRunUser = createLegacyServiceUsername(slug);
     const siteUid = "996";
     const groupId = "2222";
     await fs.mkdir(siteDirectory, { recursive: true });
@@ -840,6 +924,10 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     }
 
     const script = [
+      serviceUserForSlug,
+      serviceUserForRequest,
+      serviceLayoutFor,
+      siteDirectoryFor,
       validUidFunction,
       "validate_deploy_root() { :; }",
       "getent() {",

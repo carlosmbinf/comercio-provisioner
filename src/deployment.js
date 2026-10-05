@@ -117,8 +117,8 @@ const deployRequest = async ({
 
   const requestId = request.requestId;
   const privilegedHelper = createPrivilegedHelperRunner({ config, runner });
-  const runUser = createServiceUsername(request.slug);
-  const siteDirectory = path.resolve(config.deployRoot, request.slug);
+  const runUser = createServiceUsername(request.slug, request.requestId);
+  const siteDirectory = path.resolve(config.deployRoot, `${request.slug}--${request.requestId}`);
   if (path.dirname(siteDirectory) !== path.resolve(config.deployRoot)) {
     throw new Error("La ruta calculada de la tienda queda fuera del directorio de despliegue.");
   }
@@ -141,6 +141,7 @@ const deployRequest = async ({
     pm2Name,
     pm2Started: false,
     port: null,
+    resourceVersion: 2,
     requestId,
     runUser,
     siteDirectory,

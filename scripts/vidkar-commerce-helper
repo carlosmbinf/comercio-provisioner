@@ -70,10 +70,54 @@ service_user_for_slug() {
   printf 'vcommerce-%s' "$(printf '%s' "$1" | sha256sum | cut -c1-12)"
 }
 
+service_user_for_request() {
+  printf 'vcomreq-%s' "$(printf '%s\n%s' "$1" "$2" | sha256sum | cut -c1-16)"
+}
+
 validate_service_user() {
   slug=$1
-  run_user=$2
-  [ "$run_user" = "$(service_user_for_slug "$slug")" ] || fail "Service user does not match the requested subdomain."
+  request_id=$2
+  run_user=$3
+  [ "$run_user" = "$(service_user_for_request "$slug" "$request_id")" ] \
+    || [ "$run_user" = "$(service_user_for_slug "$slug")" ] \
+    || fail "Service user does not match the requested flow or its legacy subdomain account."
+}
+
+service_layout_for() {
+  if [ "$3" = "$(service_user_for_request "$1" "$2")" ]; then
+    printf '%s\n' request
+  elif [ "$3" = "$(service_user_for_slug "$1")" ]; then
+    printf '%s\n' legacy
+  else
+    return 1
+  fi
+}
+
+site_directory_for() {
+  layout="$(service_layout_for "$1" "$2" "$3")" || fail "Service user does not match the requested flow."
+  if [ "$layout" = legacy ]; then
+    printf '%s/%s\n' "$DEPLOY_ROOT" "$1"
+  else
+    printf '%s/%s--%s\n' "$DEPLOY_ROOT" "$1" "$2"
+  fi
+}
+
+service_home_for() {
+  layout="$(service_layout_for "$1" "$2" "$3")" || fail "Service user does not match the requested flow."
+  if [ "$layout" = legacy ]; then
+    printf '/var/lib/vidkar-commerce/%s\n' "$1"
+  else
+    printf '/var/lib/vidkar-commerce/%s\n' "$3"
+  fi
+}
+
+service_unit_for() {
+  layout="$(service_layout_for "$1" "$2" "$3")" || fail "Service user does not match the requested flow."
+  if [ "$layout" = legacy ]; then
+    printf '/etc/systemd/system/vidkar-commerce-%s.service\n' "$1"
+  else
+    printf '/etc/systemd/system/vidkar-commerce-%s.service\n' "$3"
+  fi
 }
 
 certificate_name_for_request() {
@@ -211,7 +255,8 @@ restore_request_registration_from_domain() {
 }
 
 remove_orphaned_site_directory() {
-  [ "$site_directory" = "$DEPLOY_ROOT/$slug" ] || return 1
+  expected_site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
+  [ "$site_directory" = "$expected_site_directory" ] || return 1
   validate_deploy_root
   [ ! -e "$permit_file" ] && [ ! -L "$permit_file" ] || return 1
   [ ! -e "$domain_file" ] && [ ! -L "$domain_file" ] || return 1
@@ -476,7 +521,7 @@ install_site() {
   valid_port "$port" || fail "Application port is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
   case "$run_user" in ''|root|*[!a-zA-Z0-9_-]*) fail "Service user is invalid." ;; esac
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
   validate_nginx_directories "$available_dir" "$enabled_dir"
 
@@ -529,7 +574,7 @@ remove_nginx() {
   run_user=$6
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
   validate_nginx_directories "$available_dir" "$enabled_dir"
 
@@ -537,7 +582,7 @@ remove_nginx() {
   config_file="$available_dir/$hostname.conf"
   enabled_link="$enabled_dir/$hostname.conf"
   marker="# Managed by VIDKAR commerce provisioner; request $request_id"
-  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
 
   permit_file="$HELPER_STATE_DIR/$request_id"
   if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
@@ -551,7 +596,7 @@ remove_nginx() {
   fi
   require_request "$request_id" "$slug" "$run_user"
 
-  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
   if [ -e "$service_unit" ] || [ -L "$service_unit" ]; then
     [ -f "$service_unit" ] && [ ! -L "$service_unit" ] || fail "Refusing to remove an unexpected systemd unit path."
     grep -Fqx "# Managed by VIDKAR commerce provisioner; request $request_id" "$service_unit" || fail "Refusing to remove a systemd unit not owned by this request."
@@ -594,7 +639,7 @@ remove_certificate() {
   allow_legacy=$6
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "/var/www/letsencrypt"
   validate_nginx_directories "$available_dir" "$enabled_dir"
   case "$allow_legacy" in 0|1|2) ;; *) fail "Legacy certificate cleanup flag is invalid." ;; esac
@@ -763,15 +808,15 @@ remove_site() {
   run_user=$3
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
-  site_directory="$DEPLOY_ROOT/$slug"
+  validate_service_user "$slug" "$request_id" "$run_user"
+  site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
   config_file="/etc/nginx/sites-available/$slug.vidkar.com.conf"
   enabled_link="/etc/nginx/sites-enabled/$slug.vidkar.com.conf"
-  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
   domain_file="$HELPER_STATE_DIR/domain-$slug"
   permit_file="$HELPER_STATE_DIR/$request_id"
   certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
-  service_home="/var/lib/vidkar-commerce/$slug"
+  service_home="$(service_home_for "$slug" "$request_id" "$run_user")"
   if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
     if [ -e "$permit_file" ] || [ -L "$permit_file" ]; then
       fail "Request registration exists but is not a regular root-owned file; manual review is required."
@@ -894,7 +939,9 @@ prepare_site() {
   run_user=$3
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
+  [ "$run_user" = "$(service_user_for_request "$slug" "$request_id")" ] \
+    || fail "New commerce requests require an isolated request-specific service user."
   getent group vidkar-commerce >/dev/null || fail "The vidkar-commerce service group does not exist."
   validate_deploy_root
   [ ! -L /var/lib ] && [ -d /var/lib ] && [ "$(stat -c '%U' /var/lib)" = root ] \
@@ -904,9 +951,9 @@ prepare_site() {
   install -d -o root -g root -m 0755 "$DEPLOY_ROOT"
   install -d -o root -g root -m 0755 /var/lib/vidkar-commerce
   validate_service_home_parent
-  service_home="/var/lib/vidkar-commerce/$slug"
-  site_directory="$DEPLOY_ROOT/$slug"
-  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  service_home="$(service_home_for "$slug" "$request_id" "$run_user")"
+  site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
+  service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
   [ ! -L "$site_directory" ] || fail "Commerce site path is a symlink."
   [ ! -e "$site_directory" ] || fail "Commerce site path already exists."
   [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] || fail "A systemd unit already exists for this subdomain."
@@ -957,9 +1004,9 @@ enable_pm2() {
   run_user=$3
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   require_request "$request_id" "$slug" "$run_user"
-  service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
+  service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
   marker="# Managed by VIDKAR commerce provisioner; request $request_id"
   [ -f "$service_unit" ] && grep -Fqx "$marker" "$service_unit" || fail "Systemd unit is not owned by this request."
   systemctl enable "$service_unit"
@@ -974,12 +1021,12 @@ write_site_environment() {
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
   valid_port "$port" || fail "Application port is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   require_request "$request_id" "$slug" "$run_user"
   case "$environment_base64" in ''|*[!a-zA-Z0-9+/=]*) fail "Environment payload encoding is invalid." ;; esac
   [ "${#environment_base64}" -le 32768 ] || fail "Environment payload is too large."
 
-  site_directory="$DEPLOY_ROOT/$slug"
+  site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
   validate_deploy_root
   [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || fail "Commerce site directory is missing or is a symlink."
   [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory is not owned by the registered service user."
@@ -1085,9 +1132,9 @@ service_directory() {
   run_user=$3
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   require_request "$request_id" "$slug" "$run_user"
-  directory="$DEPLOY_ROOT/$slug"
+  directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
   [ ! -L "$directory" ] && [ -d "$directory" ] || fail "Commerce site directory is missing or is a symlink."
   [ "$(stat -c '%U' "$directory")" = "$run_user" ] || fail "Commerce site directory has unexpected ownership."
   printf '%s\n' "$directory"
@@ -1222,7 +1269,7 @@ run_pm2_operation() {
   run_user=$4
   valid_slug "$slug" || fail "Subdomain slug is invalid."
   valid_request_id "$request_id" || fail "Request ID is invalid."
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   request_short="$(printf '%s' "$request_id" | cut -c1-12)"
   app_name="vidkar-comercio-$slug-$request_short"
 
@@ -1238,12 +1285,12 @@ run_pm2_operation() {
       ;;
     delete)
       validate_deploy_root
-      service_unit="/etc/systemd/system/vidkar-commerce-$slug.service"
-      site_directory="$DEPLOY_ROOT/$slug"
+      service_unit="$(service_unit_for "$slug" "$request_id" "$run_user")"
+      site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
       hostname="$slug.vidkar.com"
       config_file="/etc/nginx/sites-available/$hostname.conf"
       enabled_link="/etc/nginx/sites-enabled/$hostname.conf"
-      service_home="/var/lib/vidkar-commerce/$slug"
+      service_home="$(service_home_for "$slug" "$request_id" "$run_user")"
       service_account_entry="$(getent passwd "$run_user" || true)"
       if [ -z "$service_account_entry" ]; then
         if [ ! -e "$service_unit" ] && [ ! -L "$service_unit" ] \
@@ -1292,10 +1339,10 @@ materialize_site() {
   slug=$1
   request_id=$2
   run_user=$3
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   require_request "$request_id" "$slug" "$run_user"
   checkout_directory="$WORKER_CHECKOUT_ROOT/$request_id"
-  site_directory="$DEPLOY_ROOT/$slug"
+  site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
   [ ! -L "$WORKER_CHECKOUT_ROOT" ] && [ -d "$WORKER_CHECKOUT_ROOT" ] || fail "Worker checkout root is missing or a symlink."
   for checkout_parent in /var/lib/vidkar-provisioner /var/lib/vidkar-provisioner/state "$WORKER_CHECKOUT_ROOT"; do
     validate_worker_storage_directory "$checkout_parent"
@@ -1390,7 +1437,7 @@ issue_certificate() {
   valid_request_id "$request_id" || fail "Request ID is invalid."
   validate_paths "$available_dir" "$enabled_dir" "$acme_webroot"
   validate_nginx_directories "$available_dir" "$enabled_dir"
-  validate_service_user "$slug" "$run_user"
+  validate_service_user "$slug" "$request_id" "$run_user"
   case "$email" in *' '*|*';'*|*'`'*|*'$'*|*@*.*) ;; *) fail "Certbot email is invalid." ;; esac
 
   hostname="$slug.vidkar.com"
