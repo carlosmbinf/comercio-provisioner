@@ -190,6 +190,31 @@ raise SystemExit(0 if len(names) == 1 and names[0] == sys.argv[2].lower() else 1
 PY
 }
 
+certificate_is_reusable() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib
+import ssl
+import sys
+import time
+
+root = pathlib.Path("/etc/letsencrypt/live") / sys.argv[1]
+try:
+    certificate = ssl._ssl._test_decode_cert(str(root / "fullchain.pem"))
+    if certificate != ssl._ssl._test_decode_cert(str(root / "cert.pem")):
+        raise ValueError("Certificate and full chain do not match")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_cert_chain(str(root / "fullchain.pem"), str(root / "privkey.pem"))
+    names = [value.rstrip(".").lower() for kind, value in certificate.get("subjectAltName", ()) if kind == "DNS"]
+    now = time.time()
+    reusable = (names == [sys.argv[2].lower()]
+                and ssl.cert_time_to_seconds(certificate["notBefore"]) <= now
+                and ssl.cert_time_to_seconds(certificate["notAfter"]) > now + 2592000)
+except (OSError, ValueError, KeyError, ssl.SSLError):
+    raise SystemExit(1)
+raise SystemExit(0 if reusable else 1)
+PY
+}
+
 certificate_is_referenced() {
   reference_cert_name=$1
   reference_live_root="/etc/letsencrypt/live/$reference_cert_name/"
@@ -751,18 +776,35 @@ remove_certificate() {
   validate_service_user "$slug" "$request_id" "$run_user"
   validate_paths "$available_dir" "$enabled_dir" "/var/www/letsencrypt"
   validate_nginx_directories "$available_dir" "$enabled_dir"
-  case "$allow_legacy" in 0|1|2) ;; *) fail "Legacy certificate cleanup flag is invalid." ;; esac
+  case "$allow_legacy" in 0|1|2|3) ;; *) fail "Certificate cleanup flag is invalid." ;; esac
 
   hostname="$slug.vidkar.com"
   config_file="$available_dir/$hostname.conf"
   enabled_link="$enabled_dir/$hostname.conf"
   permit_file="$HELPER_STATE_DIR/$request_id"
   certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
+  cached_certificate_marker="$HELPER_STATE_DIR/cached-certificate-$request_id"
+  if [ ! -e "$certificate_marker" ] && [ ! -L "$certificate_marker" ] \
+    && { [ -e "$cached_certificate_marker" ] || [ -L "$cached_certificate_marker" ]; }; then
+    case "$allow_legacy" in
+      2|3) certificate_marker=$cached_certificate_marker ;;
+    esac
+  fi
   if [ -e "$config_file" ] || [ -L "$config_file" ] || [ -e "$enabled_link" ] || [ -L "$enabled_link" ]; then
     fail "Refusing to remove a certificate while the requested NGINX site still exists."
   fi
 
   if [ ! -f "$permit_file" ] || [ -L "$permit_file" ]; then
+    if [ "$allow_legacy" = "3" ] && [ "$certificate_marker" = "$cached_certificate_marker" ]; then
+      root_owned_private_state_file "$certificate_marker" \
+        || fail "Cached certificate ownership marker must be a root-owned private regular file."
+      [ "$(sed -n '1p' "$certificate_marker")" = "$slug" ] \
+        && [ "$(sed -n '2p' "$certificate_marker")" = "$hostname" ] \
+        && [ "$(sed -n '3p' "$certificate_marker")" = "$(certificate_name_for_request "$slug" "$request_id")" ] \
+        || fail "Cached certificate ownership does not match this request."
+      printf '%s\n' "CERTIFICATE_CACHED_FOR_RETRY"
+      return 0
+    fi
     if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
       restore_request_registration_from_domain "$request_id" "$slug" "$run_user" \
         || fail "Certificate ownership exists without a matching root-owned request registration."
@@ -774,7 +816,7 @@ remove_certificate() {
 
   owned_certificate_name=""
   if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
-    [ -f "$certificate_marker" ] && [ ! -L "$certificate_marker" ] || fail "Certificate ownership marker is not a regular file."
+    root_owned_private_state_file "$certificate_marker" || fail "Certificate ownership marker must be a root-owned private regular file."
     expected_certificate_name="$(certificate_name_for_request "$slug" "$request_id")"
     [ "$(sed -n '1p' "$certificate_marker")" = "$slug" ] \
       && [ "$(sed -n '2p' "$certificate_marker")" = "$hostname" ] \
@@ -875,6 +917,20 @@ remove_certificate() {
         printf '%s\n' "CERTIFICATE_PRESERVED_UNVERIFIABLE"
       fi
       continue
+    fi
+
+    if [ "$allow_legacy" = "3" ] && certificate_is_reusable "$certificate_name" "$hostname"; then
+      if [ "$certificate_marker" != "$cached_certificate_marker" ]; then
+        if [ -e "$cached_certificate_marker" ] || [ -L "$cached_certificate_marker" ]; then
+          root_owned_private_state_file "$cached_certificate_marker" \
+            && cmp -s "$certificate_marker" "$cached_certificate_marker" \
+            || fail "Cached certificate ownership does not match this request."
+        fi
+        mv "$certificate_marker" "$cached_certificate_marker" \
+          || fail_retryable "Could not cache the request-owned certificate."
+      fi
+      printf '%s\n' "CERTIFICATE_CACHED_FOR_RETRY"
+      return 0
     fi
 
     if certificate_is_referenced "$certificate_name"; then
@@ -1595,8 +1651,25 @@ issue_certificate() {
   check_dns "$hostname" "$expected_ipv4"
   certificate_name="$(certificate_name_for_request "$slug" "$request_id")"
   certificate_marker="$HELPER_STATE_DIR/certificate-$request_id"
+  cached_certificate_marker="$HELPER_STATE_DIR/cached-certificate-$request_id"
+  if [ -e "$cached_certificate_marker" ] || [ -L "$cached_certificate_marker" ]; then
+    root_owned_private_state_file "$cached_certificate_marker" \
+      || fail "Cached certificate ownership marker must be a root-owned private regular file."
+    [ "$(sed -n '1p' "$cached_certificate_marker")" = "$slug" ] \
+      && [ "$(sed -n '2p' "$cached_certificate_marker")" = "$hostname" ] \
+      && [ "$(sed -n '3p' "$cached_certificate_marker")" = "$certificate_name" ] \
+      || fail "Cached certificate ownership does not match this request."
+    if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
+      root_owned_private_state_file "$certificate_marker" \
+        && cmp -s "$certificate_marker" "$cached_certificate_marker" \
+        || fail "Active certificate ownership does not match the cached request."
+      rm -f "$cached_certificate_marker"
+    else
+      mv "$cached_certificate_marker" "$certificate_marker"
+    fi
+  fi
   if [ -e "$certificate_marker" ] || [ -L "$certificate_marker" ]; then
-    [ -f "$certificate_marker" ] && [ ! -L "$certificate_marker" ] || fail "Certificate ownership marker is not a regular file."
+    root_owned_private_state_file "$certificate_marker" || fail "Certificate ownership marker must be a root-owned private regular file."
     [ "$(sed -n '1p' "$certificate_marker")" = "$slug" ] \
       && [ "$(sed -n '2p' "$certificate_marker")" = "$hostname" ] \
       && [ "$(sed -n '3p' "$certificate_marker")" = "$certificate_name" ] \
@@ -1615,6 +1688,11 @@ issue_certificate() {
     mv "$temporary_certificate_marker" "$certificate_marker"
   fi
 
+  if certificate_is_reusable "$certificate_name" "$hostname"; then
+    printf '%s\n' "CERTIFICATE_REUSED"
+    return 0
+  fi
+  printf '%s\n' "CERTIFICATE_NOT_REUSABLE: requesting issuance or renewal."
   run_certbot_issue certonly --webroot --webroot-path "$acme_webroot" --domain "$hostname" \
     --cert-name "$certificate_name" --email "$email" --agree-tos --non-interactive \
     --no-eff-email --keep-until-expiring

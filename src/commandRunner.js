@@ -129,7 +129,12 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
       const diagnostic = ["git", "sudo"].includes(safeCommand) ? sanitizeCommandDiagnostic(stderrTail) : "";
       logger.error?.(`CMD FAIL command=${safeCommand} exit=${code ?? "desconocido"} durationMs=${durationMs}${diagnostic ? ` detail="${diagnostic}"` : ""}`);
       const certbotNetworkFailure = safeCommand === "sudo" && stderrTail.includes("CERTBOT_NETWORK_FAILED:");
-      const error = new Error(certbotNetworkFailure
+      const certbotRateLimited = safeCommand === "sudo"
+        && /too many certificates|too many requests of a given type/i.test(stderrTail);
+      const retryAfter = stderrTail.match(/retry after ([0-9-]+ [0-9:]+ UTC)/i)?.[1];
+      const error = new Error(certbotRateLimited
+        ? `Let's Encrypt bloqueó la emisión por límite de certificados.${retryAfter ? ` Reintenta después de ${retryAfter}.` : " Espera el plazo indicado por ACME."} No sigas solicitando certificados antes de ese plazo.`
+        : certbotNetworkFailure
         ? "No se pudo conectar con Let's Encrypt tras 3 intentos. Comprueba DNS y salida TCP 443 del VPS."
         : `${safeCommand} terminó con código ${code ?? "desconocido"}.`);
       if (["git", "sudo"].includes(safeCommand) && Number.isInteger(code)) {

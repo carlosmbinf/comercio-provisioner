@@ -643,6 +643,7 @@ test("Certbot reintenta fallos de red sin reintentar errores de validación", as
       ["transient", 2, 0],
       ["network", 3, 1],
       ["challenge", 1, 1],
+      ["rate-limit", 1, 1],
     ]) {
       const callLog = path.join(root, `${mode}.calls`);
       const result = spawnSync("sh", ["-c", [
@@ -655,6 +656,7 @@ test("Certbot reintenta fallos de red sin reintentar errores de validación", as
         '    success) return 0 ;;',
         '    transient) [ "$(wc -l < "$CALL_LOG")" -ge 2 ] && return 0 ;;',
         '    challenge) printf "Challenge failed for domain\\n" >&2; return 1 ;;',
+        '    rate-limit) printf "too many certificates already issued; retry after 2026-10-07 13:13:23 UTC\\n" >&2; return 1 ;;',
         "  esac",
         '  printf "Failed to establish a new connection: [Errno 101] Network is unreachable\\n" >&2',
         "  return 1",
@@ -671,8 +673,141 @@ test("Certbot reintenta fallos de red sin reintentar errores de validación", as
       if (mode === "network") assert.match(result.stderr, /CERTBOT_NETWORK_FAILED/);
       if (mode === "transient") assert.match(result.stderr, /CERTBOT_NETWORK_RETRY/);
       if (mode === "challenge") assert.doesNotMatch(result.stderr, /CERTBOT_NETWORK_RETRY/);
+      if (mode === "rate-limit") assert.doesNotMatch(result.stderr, /CERTBOT_NETWORK_RETRY/);
     }
     assert.ok((await fs.readdir(root)).every((name) => !name.startsWith(".certbot-error.")));
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
+test("la reutilización exige dominio exacto, cadena compatible y más de 30 días de vigencia", async () => {
+  const helper = await fs.readFile(path.resolve(__dirname, "../scripts/vidkar-commerce-helper"), "utf8");
+  const fn = helper.match(/^certificate_is_reusable\(\) \{\n[\s\S]*?^\}/m)?.[0];
+  assert.ok(fn);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-certificate-validity-"));
+  const live = path.join(root, "fixture");
+  await fs.mkdir(live);
+  try {
+    const run = (hostname = "store.example.test") => spawnSync("sh", ["-c", [
+      fn.replace("/etc/letsencrypt/live", root),
+      `certificate_is_reusable fixture "${hostname}"`,
+    ].join("\n")], { encoding: "utf8" });
+    for (const [days, domains, expected] of [
+      [40, "DNS:store.example.test", 0],
+      [1, "DNS:store.example.test", 1],
+      [40, "DNS:store.example.test,DNS:other.example.test", 1],
+    ]) {
+      const configFile = path.join(root, "openssl.cnf");
+      await fs.writeFile(configFile, `[req]\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\n[ext]\nsubjectAltName=${domains}\n`);
+      const created = spawnSync("openssl", [
+        "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", String(days),
+        "-subj", "/CN=store.example.test", "-config", configFile,
+        "-keyout", path.join(live, "privkey.pem"), "-out", path.join(live, "cert.pem"),
+      ], { encoding: "utf8" });
+      assert.equal(created.status, 0, created.stderr);
+      await fs.copyFile(path.join(live, "cert.pem"), path.join(live, "fullchain.pem"));
+      assert.equal(run().status, expected);
+      assert.equal(run("wrong.example.test").status, 1);
+    }
+    await fs.writeFile(path.join(live, "privkey.pem"), "invalid-key");
+    assert.equal(run().status, 1);
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
+test("el helper conserva, reutiliza y cierra el certificado de la misma solicitud sin emitir otro", async () => {
+  const helper = await fs.readFile(path.resolve(__dirname, "../scripts/vidkar-commerce-helper"), "utf8");
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-certificate-cache-"));
+  const extract = (name) => {
+    const fn = helper.match(new RegExp(`^${name}\\(\\) \\{\\n[\\s\\S]*?^\\}`, "m"))?.[0];
+    assert.ok(fn, name);
+    return fn.replaceAll("/etc/letsencrypt", path.join(root, "letsencrypt"));
+  };
+  const state = path.join(root, "state");
+  const available = path.join(root, "available");
+  const enabled = path.join(root, "enabled");
+  const lineage = "vidkar-commerce-tienda-fixture";
+  const live = path.join(root, "letsencrypt/live", lineage);
+  const archive = path.join(root, "letsencrypt/archive", lineage);
+  try {
+    for (const directory of [state, available, enabled, live, archive, path.join(root, "letsencrypt/renewal")]) {
+      await fs.mkdir(directory, { recursive: true });
+    }
+    await fs.writeFile(path.join(state, "request-fixture"), "registration");
+    await fs.writeFile(path.join(state, "certificate-request-fixture"), `tienda\ntienda.vidkar.com\n${lineage}\n`);
+    await fs.writeFile(path.join(root, "letsencrypt/renewal", `${lineage}.conf`), "renewal");
+    await fs.writeFile(path.join(live, "cert.pem"), "certificate");
+    const script = [
+      "set -eu",
+      'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
+      "fail_retryable() { fail \"$@\"; }",
+      "valid_slug() { :; }",
+      "valid_port() { :; }",
+      "valid_request_id() { :; }",
+      "validate_paths() { :; }",
+      "validate_nginx_directories() { :; }",
+      "validate_service_user() { :; }",
+      "require_request() { :; }",
+      'root_owned_private_state_file() { [ -f "$1" ] && [ ! -L "$1" ]; }',
+      'certificate_name_for_request() { printf "vidkar-commerce-tienda-fixture"; }',
+      "check_dns() { :; }",
+      "stat() { printf 'root\\n'; }",
+      "certificate_has_only_hostname() { :; }",
+      "certificate_is_reusable() { :; }",
+      "certificate_is_referenced() { return 1; }",
+      'run_certbot_issue() { printf "UNEXPECTED_ISSUANCE\\n" >&2; return 70; }',
+      "certbot() {",
+      '  printf "%s\\n" "$*" >> "$CALL_LOG"',
+      '  rm -f "$FIXTURE_ROOT/letsencrypt/renewal/vidkar-commerce-tienda-fixture.conf" "$FIXTURE_ROOT/letsencrypt/live/vidkar-commerce-tienda-fixture/cert.pem"',
+      '  rmdir "$FIXTURE_ROOT/letsencrypt/live/vidkar-commerce-tienda-fixture" "$FIXTURE_ROOT/letsencrypt/archive/vidkar-commerce-tienda-fixture"',
+      "}",
+      extract("remove_certificate"),
+      extract("issue_certificate"),
+      'remove_certificate tienda request-fixture "$AVAILABLE" "$ENABLED" fixture-user 3',
+      '[ -f "$HELPER_STATE_DIR/cached-certificate-request-fixture" ]',
+      '[ ! -e "$HELPER_STATE_DIR/certificate-request-fixture" ]',
+      'printf "# Managed by VIDKAR commerce provisioner; request request-fixture\\n" > "$AVAILABLE/tienda.vidkar.com.conf"',
+      'issue_certificate tienda 5200 request-fixture ops@example.test "$AVAILABLE" "$ENABLED" /var/www/letsencrypt 192.0.2.1 fixture-user',
+      '[ -f "$HELPER_STATE_DIR/certificate-request-fixture" ]',
+      '[ ! -e "$HELPER_STATE_DIR/cached-certificate-request-fixture" ]',
+      'rm -f "$AVAILABLE/tienda.vidkar.com.conf"',
+      'remove_certificate tienda request-fixture "$AVAILABLE" "$ENABLED" fixture-user 3',
+      'rm -f "$HELPER_STATE_DIR/request-fixture"',
+      'remove_certificate tienda request-fixture "$AVAILABLE" "$ENABLED" fixture-user 3',
+      'printf "registration\\n" > "$HELPER_STATE_DIR/request-fixture"',
+      'remove_certificate tienda request-fixture "$AVAILABLE" "$ENABLED" fixture-user 2',
+      '[ ! -e "$HELPER_STATE_DIR/cached-certificate-request-fixture" ]',
+    ].join("\n");
+    const callLog = path.join(root, "calls");
+    const result = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: { ...process.env, HELPER_STATE_DIR: state, AVAILABLE: available, ENABLED: enabled, FIXTURE_ROOT: root, CALL_LOG: callLog },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /CERTIFICATE_REUSED/);
+    assert.equal((result.stdout.match(/CERTIFICATE_CACHED_FOR_RETRY/g) || []).length, 3);
+    assert.equal((await fs.readFile(callLog, "utf8")).trim(), `delete --cert-name ${lineage} --non-interactive`);
+
+    await fs.writeFile(path.join(state, "cached-certificate-request-fixture"), `different-store\ntienda.vidkar.com\n${lineage}\n`);
+    await fs.writeFile(path.join(available, "tienda.vidkar.com.conf"), "# Managed by VIDKAR commerce provisioner; request request-fixture\n");
+    const refused = spawnSync("sh", ["-c", [
+      "set -eu",
+      'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
+      "valid_slug() { :; }; valid_port() { :; }; valid_request_id() { :; }",
+      "validate_paths() { :; }; validate_nginx_directories() { :; }; validate_service_user() { :; }",
+      "require_request() { :; }; check_dns() { :; }",
+      'root_owned_private_state_file() { [ -f "$1" ] && [ ! -L "$1" ]; }',
+      'certificate_name_for_request() { printf "vidkar-commerce-tienda-fixture"; }',
+      extract("issue_certificate"),
+      'issue_certificate tienda 5200 request-fixture ops@example.test "$AVAILABLE" "$ENABLED" /var/www/letsencrypt 192.0.2.1 fixture-user',
+    ].join("\n")], {
+      encoding: "utf8",
+      env: { ...process.env, HELPER_STATE_DIR: state, AVAILABLE: available, ENABLED: enabled },
+    });
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /Cached certificate ownership does not match/);
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }
@@ -703,7 +838,7 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   assert.match(helper, /certbot delete --cert-name "\$certificate_name" --non-interactive/);
   assert.match(helper, /CERTIFICATE_PRESERVED_SHARED_SAN/);
   assert.match(helper, /CERTIFICATE_PRESERVED_IN_USE/);
-  assert.match(helper, /case "\$allow_legacy" in 0\|1\|2/);
+  assert.match(helper, /case "\$allow_legacy" in 0\|1\|2\|3/);
   assert.match(helper, /elif \[ "\$allow_legacy" = "2" \]; then\s+owned_certificate_name=\$hostname/);
   assert.doesNotMatch(helper, /rm -rf[^\n]*\/etc\/letsencrypt/);
 
@@ -1271,10 +1406,28 @@ test("el rollback informa cuando conserva un certificado no exclusivo", async ()
 
   assert.equal(result.rollbackSucceeded, true);
   assert.ok(commands.some((args) => args.includes("remove-certificate")), JSON.stringify(commands));
+  assert.equal(commands.find((args) => args.includes("remove-certificate")).at(-1), "3");
   const certificateReport = reports.find(([stepId, outcome]) => stepId === "remove_certificate" && outcome === "COMPLETED");
   assert.match(certificateReport[2], /Certbot conservó el certificado/);
   assert.match(certificateReport[2], /CERTIFICATE_PRESERVED_IN_USE/);
   assert.ok(warnings.some(([message]) => /Certbot conservó el certificado/.test(message)));
+
+  const cachedReports = [];
+  const cached = await rollbackDeployment({
+    config,
+    journal,
+    logger: { error() {}, info() {}, warn() {} },
+    onRollbackStep: async (...report) => cachedReports.push(report),
+    runner: {
+      runCommand: async (_command, args) => ({
+        stdoutTail: args.includes("remove-certificate") ? "CERTIFICATE_CACHED_FOR_RETRY\n" : "",
+      }),
+    },
+    stateStore: { write: async () => {} },
+  });
+  assert.equal(cached.rollbackSucceeded, true);
+  const cachedReport = cachedReports.find(([stepId, outcome]) => stepId === "remove_certificate" && outcome === "COMPLETED");
+  assert.match(cachedReport[2], /caché privada de esta solicitud/);
 });
 
 test("el rollback conserva Nginx y la cuenta si no puede confirmar que PM2 se detuvo", async () => {

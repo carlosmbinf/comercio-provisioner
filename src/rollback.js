@@ -96,8 +96,11 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
         config.nginxSitesAvailable,
         config.nginxSitesEnabled,
         journal.runUser,
-        journal.certificateIssued ? "1" : "0",
+        "3",
       ], { timeoutMs: config.commandTimeoutMs });
+      if ((result?.stdoutTail || "").split(/\r?\n/).includes("CERTIFICATE_CACHED_FOR_RETRY")) {
+        return `Se conservó el certificado válido de ${journal.hostname} en la caché privada de esta solicitud para reutilizarlo al reintentar.`;
+      }
       const preserved = (result?.stdoutTail || "").split(/\r?\n/)
         .filter((line) => /^CERTIFICATE_PRESERVED(?:_[A-Z_]+)?$/.test(line));
       if (preserved.length) {
@@ -135,13 +138,6 @@ const rollbackDeployment = async ({ assertLease = () => {}, config, journal, log
       if (info) await fs.rm(journal.checkoutDirectory, { force: true, recursive: true });
     }
   });
-
-  if (!journal.certificateIssued) {
-    // Certbot puede dejar metadatos locales de una emisión interrumpida; no se borran
-    // certificados sin validar que pertenecen exclusivamente a esta solicitud.
-  } else {
-    logger.warn?.(`[comercio-provisioner] Se conserva el certificado de ${journal.hostname}; Certbot registra su propio ciclo de vida.`);
-  }
 
   const rollbackSucceeded = errors.length === 0;
   const nextJournal = {

@@ -112,3 +112,23 @@ test("runner comunica el fallo de conectividad ACME sin ocultar el código de sa
     },
   );
 });
+
+test("runner informa el límite ACME y su fecha UTC de reintento", async () => {
+  const spawnImpl = (_command, _args, options) => spawn(process.execPath, [
+    "-e",
+    "process.stderr.write('too many certificates (5) already issued; retry after 2026-10-07 13:13:23 UTC\\nCERTBOT_FAILED: fixture'); process.exit(1)",
+  ], options);
+  await assert.rejects(
+    () => runCommand("sudo", ["helper"], {
+      logger: { info() {}, error() {} },
+      spawnImpl,
+      timeoutMs: 5000,
+    }),
+    (error) => {
+      assert.match(error.message, /límite de certificados/);
+      assert.match(error.message, /2026-10-07 13:13:23 UTC/);
+      assert.equal(error.commandFailure.exitCode, 1);
+      return true;
+    },
+  );
+});
