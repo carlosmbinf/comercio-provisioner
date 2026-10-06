@@ -284,6 +284,7 @@ restore_request_registration_from_domain() {
 
 remove_orphaned_site_directory() {
   orphan_site_refusal="No se pudo demostrar la propiedad de la carpeta huérfana."
+  orphan_site_recovery_mode=""
   expected_site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
   [ "$site_directory" = "$expected_site_directory" ] \
     || { orphan_site_block "La ruta del journal no coincide con el layout de este requestId."; return 1; }
@@ -340,14 +341,6 @@ remove_orphaned_site_directory() {
       || { orphan_site_block "No se pudo comprobar si quedan procesos de la cuenta request-scoped."; return 1; }
     [ -z "$orphan_processes" ] \
       || { orphan_site_block "La cuenta request-scoped todavía tiene procesos activos."; return 1; }
-    userdel --remove "$run_user" || fail_retryable "Could not remove the verified request-scoped orphan service account."
-    if getent passwd "$run_user" >/dev/null; then
-      fail_retryable "The verified request-scoped service account remains after userdel."
-    fi
-    if [ -e "$service_home" ] || [ -L "$service_home" ]; then
-      validate_orphaned_service_home "$orphan_site_uid" "$service_home"
-      rm -rf -- "$service_home" || fail_retryable "Could not remove the verified request-scoped orphan service home."
-    fi
   else
     [ ! -e "$service_home" ] && [ ! -L "$service_home" ] \
       || { orphan_site_block "El home de servicio todavía existe sin una cuenta verificable."; return 1; }
@@ -393,7 +386,18 @@ remove_orphaned_site_directory() {
     || { orphan_site_block "No se pudo comprobar si quedan procesos del UID huérfano."; return 1; }
   [ -z "$orphan_processes" ] \
     || { orphan_site_block "El UID de la carpeta todavía tiene procesos activos."; return 1; }
+
+  if getent passwd "$run_user" >/dev/null; then
+    register_request "$request_id" "$slug" "$run_user"
+    require_request "$request_id" "$slug" "$run_user"
+    record_service_uid "$request_id" "$slug" "$run_user"
+    orphan_site_recovery_mode="registered"
+    printf '%s\n' "ORPHAN_SITE_REGISTRATION_RESTORED"
+    return 0
+  fi
+
   rm -rf -- "$site_directory" || fail_retryable "Could not remove the verified orphaned commerce site directory."
+  orphan_site_recovery_mode="removed"
   printf '%s\n' "ORPHAN_SITE_DIRECTORY_REMOVED"
 }
 
@@ -930,7 +934,7 @@ remove_site() {
       if restore_request_registration_from_domain "$request_id" "$slug" "$run_user"; then
         :
       elif remove_orphaned_site_directory; then
-        return 0
+        [ "$orphan_site_recovery_mode" != "removed" ] || return 0
       else
         fail "Site resources exist without a verifiable root-owned request registration or matching orphan-site evidence: ${orphan_site_refusal:-no se pudo determinar el motivo}; manual review is required."
       fi

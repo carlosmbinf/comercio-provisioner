@@ -664,6 +664,10 @@ test("el helper limita Certbot al lineage de una solicitud y preserva certificad
   const removeSiteFunction = helper.match(/remove_site\(\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(removeSiteFunction, "debe encontrar la función que retira la tienda");
   assert.match(removeSiteFunction, /remove_service_account "\$run_user" "\$service_home" "\$pm2_binary"/);
+  const siteDeleteBeforeAccountPosition = removeSiteFunction.indexOf('rm -rf -- "$site_directory"');
+  const serviceAccountDeletePosition = removeSiteFunction.indexOf('remove_service_account "$run_user" "$service_home" "$pm2_binary"');
+  assert.ok(siteDeleteBeforeAccountPosition >= 0 && serviceAccountDeletePosition > siteDeleteBeforeAccountPosition,
+    "debe borrar la carpeta del sitio antes de eliminar la cuenta Linux");
   const processTerminationFunction = helper.match(/terminate_service_user_processes\(\) \{([\s\S]*?)\n\}/)?.[1];
   assert.ok(processTerminationFunction, "debe encontrar la limpieza de procesos de la cuenta aislada");
   assert.match(processTerminationFunction, /while \[ "\$process_signal_attempt" -le 5 \]/);
@@ -989,6 +993,9 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       orphanSiteBlock,
       validUidFunction,
       "validate_deploy_root() { :; }",
+      'register_request() { printf "%s:%s:%s\\n" "$1" "$2" "$3" >> "$REGISTRATION_LOG"; }',
+      "require_request() { :; }",
+      "record_service_uid() { :; }",
       "getent() {",
       '  if [ "$1" = "group" ] && [ "$2" = "vidkar-commerce" ]; then printf "vidkar-commerce:x:%s:\\n" "$GROUP_ID"; return 0; fi',
       '  if [ "$1" = "passwd" ]; then',
@@ -1011,7 +1018,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       "}",
       'list_service_user_processes() { [ "$ACTIVE_PROCESS" = "1" ] && printf "4321\\n"; return 0; }',
       "validate_service_home_parent() { :; }",
-      'userdel() { [ "$1" = "--remove" ] && [ "$2" = "$RUN_USER" ] || return 1; ACCOUNT_EXISTS=0; rm -rf -- "$SERVICE_HOME"; }',
+      'userdel() { printf "unexpected userdel\\n" >&2; exit 70; }',
       removeOrphanFunction,
       "remove_orphaned_site_directory",
     ].join("\n");
@@ -1031,6 +1038,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
         orphan_site_directory: siteDirectory,
         permit_file: path.join(stateDirectory, requestId),
         request_id: requestId,
+        REGISTRATION_LOG: path.join(scenarioRoot, "registrations"),
         RUN_USER: requestRunUser,
         run_user: requestRunUser,
         service_home: serviceHome,
@@ -1074,8 +1082,12 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
 
     const recoveredRequestAccount = await runRecovery({ accountExists: true, requestScopedAccount: true });
     assert.equal(recoveredRequestAccount.result.status, 0, recoveredRequestAccount.result.stderr);
-    assert.match(recoveredRequestAccount.result.stdout, /ORPHAN_SITE_DIRECTORY_REMOVED/);
-    assert.equal(recoveredRequestAccount.exists, false);
+    assert.match(recoveredRequestAccount.result.stdout, /ORPHAN_SITE_REGISTRATION_RESTORED/);
+    assert.equal(recoveredRequestAccount.exists, true);
+    assert.equal(
+      await fs.readFile(path.join(root, "case-8", "registrations"), "utf8"),
+      `${requestId}:tienda:${createServiceUsername(slug, requestId)}\n`,
+    );
 
     const activeRequestAccount = await runRecovery({
       accountExists: true,
