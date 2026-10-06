@@ -91,3 +91,24 @@ test("runner registra diagnóstico sudo del helper con secretos redactados", asy
     stderr: "helper rejected SECRET=[redactado] Authorization: Bearer [redactado]",
   });
 });
+
+test("runner comunica el fallo de conectividad ACME sin ocultar el código de salida", async () => {
+  const spawnImpl = (_command, _args, options) => spawn(process.execPath, [
+    "-e",
+    "process.stderr.write('CERTBOT_NETWORK_FAILED: fixture\\n'); process.exit(1)",
+  ], options);
+
+  await assert.rejects(
+    () => runCommand("sudo", ["helper"], {
+      logger: { info() {}, error() {} },
+      spawnImpl,
+      timeoutMs: 5000,
+    }),
+    (error) => {
+      assert.match(error.message, /Let's Encrypt tras 3 intentos/);
+      assert.equal(error.commandFailure.exitCode, 1);
+      assert.match(error.commandFailure.stderr, /CERTBOT_NETWORK_FAILED/);
+      return true;
+    },
+  );
+});

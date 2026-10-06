@@ -1541,6 +1541,34 @@ PY
   rm -rf -- "$checkout_directory"
 }
 
+run_certbot_issue() {
+  certbot_error_file="$(mktemp "$HELPER_STATE_DIR/.certbot-error.XXXXXX")"
+  certbot_attempt=1
+  while :; do
+    if certbot "$@" 2>"$certbot_error_file"; then
+      cat "$certbot_error_file" >&2
+      rm -f "$certbot_error_file"
+      return 0
+    else
+      certbot_exit=$?
+    fi
+    cat "$certbot_error_file" >&2
+    if ! grep -Eq 'Network is unreachable|Failed to establish a new connection|ConnectTimeout|Connection timed out|Temporary failure in name resolution' "$certbot_error_file"; then
+      rm -f "$certbot_error_file"
+      printf 'CERTBOT_FAILED: La emisión HTTPS falló; revisar /var/log/letsencrypt/letsencrypt.log.\n' >&2
+      return "$certbot_exit"
+    fi
+    if [ "$certbot_attempt" -ge 3 ]; then
+      rm -f "$certbot_error_file"
+      printf 'CERTBOT_NETWORK_FAILED: No se pudo conectar con ACME tras 3 intentos; comprobar DNS y salida TCP 443 del VPS hacia Let'\''s Encrypt.\n' >&2
+      return "$certbot_exit"
+    fi
+    printf 'CERTBOT_NETWORK_RETRY: Falló la conexión con ACME; reintentando (%s/3).\n' "$certbot_attempt" >&2
+    certbot_attempt=$((certbot_attempt + 1))
+    sleep 5
+  done
+}
+
 issue_certificate() {
   slug=$1
   port=$2
@@ -1587,7 +1615,7 @@ issue_certificate() {
     mv "$temporary_certificate_marker" "$certificate_marker"
   fi
 
-  certbot certonly --webroot --webroot-path "$acme_webroot" --domain "$hostname" \
+  run_certbot_issue certonly --webroot --webroot-path "$acme_webroot" --domain "$hostname" \
     --cert-name "$certificate_name" --email "$email" --agree-tos --non-interactive \
     --no-eff-email --keep-until-expiring
   certificate_file="/etc/letsencrypt/live/$certificate_name/cert.pem"

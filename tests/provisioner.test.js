@@ -632,6 +632,52 @@ test("deshabilitar una unidad systemd es idempotente y conserva el error real", 
   }
 });
 
+test("Certbot reintenta fallos de red sin reintentar errores de validación", async () => {
+  const helper = await fs.readFile(path.resolve(__dirname, "../scripts/vidkar-commerce-helper"), "utf8");
+  const issueFunction = helper.match(/^run_certbot_issue\(\) \{\n[\s\S]*?^\}/m)?.[0];
+  assert.ok(issueFunction);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-certbot-retry-"));
+  try {
+    for (const [mode, expectedAttempts, expectedStatus] of [
+      ["success", 1, 0],
+      ["transient", 2, 0],
+      ["network", 3, 1],
+      ["challenge", 1, 1],
+    ]) {
+      const callLog = path.join(root, `${mode}.calls`);
+      const result = spawnSync("sh", ["-c", [
+        "set -eu",
+        issueFunction,
+        'sleep() { :; }',
+        "certbot() {",
+        '  printf "%s\\n" "$*" >> "$CALL_LOG"',
+        '  case "$MODE" in',
+        '    success) return 0 ;;',
+        '    transient) [ "$(wc -l < "$CALL_LOG")" -ge 2 ] && return 0 ;;',
+        '    challenge) printf "Challenge failed for domain\\n" >&2; return 1 ;;',
+        "  esac",
+        '  printf "Failed to establish a new connection: [Errno 101] Network is unreachable\\n" >&2',
+        "  return 1",
+        "}",
+        'run_certbot_issue certonly --domain store.example.test --cert-name request-fixture',
+      ].join("\n")], {
+        encoding: "utf8",
+        env: { ...process.env, HELPER_STATE_DIR: root, CALL_LOG: callLog, MODE: mode },
+      });
+      assert.equal(result.status, expectedStatus, result.stderr);
+      const calls = (await fs.readFile(callLog, "utf8")).trim().split("\n");
+      assert.equal(calls.length, expectedAttempts);
+      assert.ok(calls.every((call) => call === "certonly --domain store.example.test --cert-name request-fixture"));
+      if (mode === "network") assert.match(result.stderr, /CERTBOT_NETWORK_FAILED/);
+      if (mode === "transient") assert.match(result.stderr, /CERTBOT_NETWORK_RETRY/);
+      if (mode === "challenge") assert.doesNotMatch(result.stderr, /CERTBOT_NETWORK_RETRY/);
+    }
+    assert.ok((await fs.readdir(root)).every((name) => !name.startsWith(".certbot-error.")));
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
 test("el helper limita Certbot al lineage de una solicitud y preserva certificados compartidos o referenciados", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");

@@ -128,7 +128,10 @@ const runCommand = (command, args = [], options = {}) => new Promise((resolve, r
     } else {
       const diagnostic = ["git", "sudo"].includes(safeCommand) ? sanitizeCommandDiagnostic(stderrTail) : "";
       logger.error?.(`CMD FAIL command=${safeCommand} exit=${code ?? "desconocido"} durationMs=${durationMs}${diagnostic ? ` detail="${diagnostic}"` : ""}`);
-      const error = new Error(`${safeCommand} terminó con código ${code ?? "desconocido"}.`);
+      const certbotNetworkFailure = safeCommand === "sudo" && stderrTail.includes("CERTBOT_NETWORK_FAILED:");
+      const error = new Error(certbotNetworkFailure
+        ? "No se pudo conectar con Let's Encrypt tras 3 intentos. Comprueba DNS y salida TCP 443 del VPS."
+        : `${safeCommand} terminó con código ${code ?? "desconocido"}.`);
       if (["git", "sudo"].includes(safeCommand) && Number.isInteger(code)) {
         error.commandFailure = {
           command: safeCommand,
