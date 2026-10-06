@@ -953,6 +953,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     accountExists = false,
     domainMarker = false,
     environmentRequestId = requestId,
+    missingEnvironment = false,
     mode = "700",
     requestScopedAccount = false,
     reusedUid = false,
@@ -975,11 +976,13 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       await fs.mkdir(serviceHome, { recursive: true, mode: 0o700 });
       await fs.chmod(serviceHome, 0o700);
     }
-    await fs.writeFile(environmentFile, [
-      `COMERCIO_HOST='${slug}.vidkar.com'`,
-      `PM2_APP_NAME='vidkar-comercio-${slug}-${environmentRequestId.slice(0, 12)}'`,
-      "",
-    ].join("\n"), { mode: 0o600 });
+    if (!missingEnvironment) {
+      await fs.writeFile(environmentFile, [
+        `COMERCIO_HOST='${slug}.vidkar.com'`,
+        `PM2_APP_NAME='vidkar-comercio-${slug}-${environmentRequestId.slice(0, 12)}'`,
+        "",
+      ].join("\n"), { mode: 0o600 });
+    }
     if (domainMarker) {
       await fs.mkdir(stateDirectory, { recursive: true });
       await fs.writeFile(path.join(stateDirectory, `domain-${slug}`), "another-request\n");
@@ -991,6 +994,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       serviceLayoutFor,
       siteDirectoryFor,
       orphanSiteBlock,
+      extractFunction("validate_orphan_environment"),
       validUidFunction,
       "validate_deploy_root() { :; }",
       'register_request() { printf "%s:%s:%s\\n" "$1" "$2" "$3" >> "$REGISTRATION_LOG"; }',
@@ -1056,6 +1060,7 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     });
     return {
       exists: await fs.stat(siteDirectory).then(() => true, () => false),
+      registrationLog: path.join(scenarioRoot, "registrations"),
       result,
     };
   };
@@ -1069,7 +1074,8 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     for (const invalidProof of [
       { environmentRequestId: "another-request" },
       { activeProcess: true },
-      { accountExists: true, requestScopedAccount: false },
+      { accountExists: true, missingEnvironment: true, requestScopedAccount: false },
+      { missingEnvironment: true, requestScopedAccount: false },
       { reusedUid: true },
       { domainMarker: true },
       { mode: "755" },
@@ -1080,12 +1086,12 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
       assert.equal(refused.exists, true, JSON.stringify(invalidProof));
     }
 
-    const recoveredRequestAccount = await runRecovery({ accountExists: true, requestScopedAccount: true });
-    assert.equal(recoveredRequestAccount.result.status, 0, recoveredRequestAccount.result.stderr);
-    assert.match(recoveredRequestAccount.result.stdout, /ORPHAN_SITE_REGISTRATION_RESTORED/);
-    assert.equal(recoveredRequestAccount.exists, true);
+    const recoveredRequestAccountWithEnv = await runRecovery({ accountExists: true, requestScopedAccount: true });
+    assert.equal(recoveredRequestAccountWithEnv.result.status, 0, recoveredRequestAccountWithEnv.result.stderr);
+    assert.match(recoveredRequestAccountWithEnv.result.stdout, /ORPHAN_SITE_REGISTRATION_RESTORED/);
+    assert.equal(recoveredRequestAccountWithEnv.exists, true);
     assert.equal(
-      await fs.readFile(path.join(root, "case-8", "registrations"), "utf8"),
+      await fs.readFile(recoveredRequestAccountWithEnv.registrationLog, "utf8"),
       `${requestId}:tienda:${createServiceUsername(slug, requestId)}\n`,
     );
 
@@ -1096,6 +1102,23 @@ test("el helper elimina solo un directorio huérfano ligado al slug y requestId 
     });
     assert.equal(activeRequestAccount.result.status, 1);
     assert.equal(activeRequestAccount.exists, true);
+
+    const recoveredRequestDirectory = await runRecovery({ missingEnvironment: true, requestScopedAccount: true });
+    assert.equal(recoveredRequestDirectory.result.status, 0, recoveredRequestDirectory.result.stderr);
+    assert.equal(recoveredRequestDirectory.exists, false);
+
+    const recoveredRequestAccount = await runRecovery({
+      accountExists: true,
+      missingEnvironment: true,
+      requestScopedAccount: true,
+    });
+    assert.equal(recoveredRequestAccount.result.status, 0, recoveredRequestAccount.result.stderr);
+    assert.match(recoveredRequestAccount.result.stdout, /ORPHAN_SITE_REGISTRATION_RESTORED/);
+    assert.equal(recoveredRequestAccount.exists, true);
+    assert.equal(
+      await fs.readFile(recoveredRequestAccount.registrationLog, "utf8"),
+      `${requestId}:tienda:${createServiceUsername(slug, requestId)}\n`,
+    );
   } finally {
     await fs.rm(root, { force: true, recursive: true });
   }
