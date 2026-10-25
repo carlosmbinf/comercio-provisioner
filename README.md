@@ -14,6 +14,20 @@ Worker Node independiente de `react-download`. Consume tareas por DDP sobre `wss
 
 La documentación pública de Squarespace no ofrece una API de DNS. Sus Commerce APIs administran datos de tiendas Squarespace y el portal de desarrolladores marca las Reseller APIs de sitios/dominios como “Coming soon”. Referencias: `https://developers.squarespace.com/` y `https://support.squarespace.com/hc/en-us/articles/31119879125645-DNS-records-for-web-hosting`.
 
+## Actualizar tiendas desplegadas
+
+En `/admin/comercio-provisioning`, el administrador principal puede usar **Actualizar código** en una tienda completada. La confirmación encola solo esa tienda; no reinicia el aprovisionamiento ni ejecuta su rollback destructivo. Se muestran estado, resultado, fecha y revisión Git.
+
+- El worker obtiene una copia limpia de la rama `COMERCIO_REPOSITORY_REF` del repositorio autorizado `COMERCIO_REPOSITORY_URL`. Es el equivalente operativo de traer la última versión, no un `git pull` en la carpeta pública: las tiendas no conservan `.git`.
+- Prepara el nuevo código en `<carpeta-tienda>.update`, conserva el `.env` existente e instala dependencias como la cuenta aislada de esa tienda antes de sustituir la versión activa.
+- Renombra la versión anterior a `<carpeta-tienda>.previous`, activa la nueva y ejecuta `PM2 startOrRestart` solo para su nombre de aplicación. Comprueba HTTP local y HTTPS. Puede haber una interrupción breve durante el cambio/reinicio.
+- No modifica DNS, Nginx, certificados, puertos, cuentas ni datos de Mongo/Meteor. Los archivos locales que no sean parte del repositorio no se trasladan a la nueva versión, salvo `.env`; la copia anterior los conserva. Las tiendas son clientes frontend, no almacenamiento de datos de negocio.
+- Si falla la preparación, la versión activa permanece intacta. Si falla la activación o salud, intenta restaurar y comprobar la anterior. Una restauración no confirmada se reporta explícitamente; el siguiente intento primero recupera la versión anterior, sin desplegar cambios nuevos.
+- La copia `.previous` se conserva hasta la siguiente preparación y se elimina junto con la tienda al cerrarla. Reserva espacio para la versión activa, la preparada y la anterior, incluidas sus dependencias.
+- La actualización usa el mismo lock local y fencing/lease del worker. Un reinicio reconcilia el journal antes de continuar. No se puede cerrar una tienda con actualización pendiente o en curso. El estado principal sigue siendo `COMPLETADA` para conservar los contratos de los clientes; el progreso independiente está en `codeUpdate`.
+
+Para habilitar esta acción, despliega primero el backend de VIDKAR y luego actualiza **tanto el código del worker como el helper root-owned instalado** siguiendo [la guía del VPS](./GUIA_VPS.md). Reinicia únicamente el proceso PM2 del provisionador. El worker anuncia `codeUpdates: true`; una versión anterior no reclama estas tareas y el panel informa que debe actualizarse. No copies ni regeneres el `.env`, el token, la clave HMAC o los journals durante este despliegue.
+
 ## Configuración
 
 La configuración del worker está centralizada en el `.env` local de este proyecto. No se debe versionar ni copiar a registros, mensajes de error o tareas. En un checkout nuevo, crea `.env` a partir de [.env.example](./.env.example); el archivo `.env` no se distribuye ni se versiona.

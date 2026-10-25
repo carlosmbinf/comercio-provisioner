@@ -80,6 +80,20 @@ const assertNoTrackedEnvironmentFile = async ({ runner, siteDirectory, config })
   }
 };
 
+const checkoutRepository = async ({ config, directory, runner }) => {
+  const options = {
+    cwd: path.dirname(directory),
+    envOverrides: { GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    timeoutMs: config.commandTimeoutMs,
+  };
+  await runner.runCommand("git", [
+    "clone", "--depth", "1", "--filter=blob:none", "--no-checkout", "--branch",
+    config.repositoryRef, config.repositoryUrl, directory,
+  ], options);
+  await assertNoTrackedEnvironmentFile({ config, runner, siteDirectory: directory });
+  await runner.runCommand("git", ["-C", directory, "checkout", "--force"], options);
+};
+
 const createHttpResponseCheck = async (url, fetchImpl = fetch, timeoutMs = 10000) => {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -228,24 +242,7 @@ const deployRequest = async ({
         await fs.mkdir(checkoutDirectory, { mode: 0o700 });
         journal.checkoutDirectoryCreated = true;
         await stateStore.write(requestId, journal);
-        await runner.runCommand("git", [
-          "clone", "--depth", "1", "--filter=blob:none", "--no-checkout", "--branch",
-          config.repositoryRef, config.repositoryUrl, checkoutDirectory,
-        ], {
-          cwd: path.dirname(checkoutDirectory),
-          envOverrides: { GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
-          timeoutMs: config.commandTimeoutMs,
-        });
-        await assertNoTrackedEnvironmentFile({
-          runner,
-          siteDirectory: checkoutDirectory,
-          config,
-        });
-        await runner.runCommand("git", ["-C", checkoutDirectory, "checkout", "--force"], {
-          cwd: path.dirname(checkoutDirectory),
-          envOverrides: { GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
-          timeoutMs: config.commandTimeoutMs,
-        });
+        await checkoutRepository({ config, directory: checkoutDirectory, runner });
         await privilegedHelper.run("materialize-site", [request.slug, requestId, runUser], {
           timeoutMs: config.commandTimeoutMs,
         });
@@ -360,6 +357,7 @@ const waitForHealth = async (url, fetchImpl = fetch, options = {}) => {
 
 module.exports = {
   assertNoTrackedEnvironmentFile,
+  checkoutRepository,
   certificateNameForRequest,
   createHttpResponseCheck,
   deployRequest,

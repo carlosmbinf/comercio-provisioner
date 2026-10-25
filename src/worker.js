@@ -1,6 +1,7 @@
 const { deployRequest } = require("./deployment");
 const { rollbackDeployment } = require("./rollback");
 const { closeDeployment } = require("./closure");
+const { updateDeployment } = require("./update");
 const { createLogger } = require("./logger");
 const { sanitizeMessage } = require("./workerUtils");
 const { sleep } = require("./taskLock");
@@ -113,6 +114,7 @@ const startWorker = ({
   deploy = deployRequest,
   rollback = rollbackDeployment,
   close = closeDeployment,
+  update = updateDeployment,
 }) => {
   const rootLogger = createLogger({ workerId: config.workerId }, logger);
   let stopping = false;
@@ -574,6 +576,46 @@ const startWorker = ({
     }
   };
 
+  const processCodeUpdate = async (task) => {
+    const taskLogger = rootLogger.child({ flow: "update", hostname: task.hostname, requestId: task.requestId, slug: task.slug });
+    setActiveTask(task);
+    let lock;
+    const fencedClient = createFencedClient({ assertLease, client, config, onLeaseLost: markLeaseLost, task });
+    try {
+      lock = await acquireTaskLock(task.requestId);
+      taskLogger.info("UPDATE START actualización aislada de código");
+      let result;
+      try {
+        result = await update({
+          assertLease, config, logger: taskLogger, request: task,
+          runner: createTaskRunner(lock, taskLogger), stateStore,
+        });
+      } catch (error) {
+        assertLease();
+        taskLogger.error(`UPDATE FAIL ${sanitizeMessage(error?.message || "Error de actualización")}`);
+        result = { succeeded: false, message: sanitizeMessage(error?.message || "No se pudo actualizar la tienda."), commit: "" };
+      }
+      assertLease();
+      const finish = () => fencedClient.call(
+        "comercio.provisioning.worker.finishCodeUpdate",
+        config.token, config.workerId, task.requestId,
+        task.updateId, result.succeeded, result.message, result.commit,
+      );
+      try {
+        await finish();
+      } catch (_error) {
+        assertLease();
+        await finish();
+      }
+      taskLogger.info(`UPDATE ${result.succeeded ? "OK" : "FAILED"} resultado confirmado por VIDKAR`);
+    } catch (error) {
+      taskLogger.error(`UPDATE DEFERRED ${sanitizeMessage(error?.message || "No se pudo confirmar la actualización")}; el lease permitirá reconciliar el journal.`);
+    } finally {
+      await lock?.release();
+      clearActiveTask();
+    }
+  };
+
   const sendHeartbeat = async () => {
     if (heartbeatBusy) return;
     heartbeatBusy = true;
@@ -613,6 +655,7 @@ const startWorker = ({
         config.publicIpv4,
         true,
         config.workerIdentity || config.workerId,
+        true,
       );
       workerRegistered = true;
       rootLogger.info("WORKER registrado; esperando tareas con DNS verificado");
@@ -628,7 +671,8 @@ const startWorker = ({
             continue;
           }
           if (!task.leaseToken) throw new Error("El backend no asignó un fencing token al trabajo.");
-          if (task.operation === "close") await processClosure(task);
+          if (task.operation === "update") await processCodeUpdate(task);
+          else if (task.operation === "close") await processClosure(task);
           else if (task.recoveryRequired) await processRecovery(task);
           else await processDeployment(task);
         } catch (error) {

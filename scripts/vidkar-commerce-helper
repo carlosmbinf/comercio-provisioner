@@ -1085,6 +1085,8 @@ remove_site() {
   if [ "$checkout_exists" -eq 1 ]; then
     rm -rf -- "$checkout_directory" || fail_retryable "Could not remove the worker checkout for this store."
   fi
+  remove_update_directory "$(site_directory_for "$slug" "$request_id" "$run_user").update"
+  remove_update_directory "$(site_directory_for "$slug" "$request_id" "$run_user").previous"
   if [ "$site_exists" -eq 1 ]; then
     rm -rf -- "$site_directory" || fail_retryable "Could not remove this store's site directory."
   fi
@@ -1456,11 +1458,13 @@ run_pm2_operation() {
   app_name="vidkar-comercio-$slug-$request_short"
 
   case "$operation" in
-    start|save)
+    start|save|restart)
       directory="$(service_directory "$slug" "$request_id" "$run_user")"
       pm2_binary="$(trusted_binary pm2)"
       if [ "$operation" = "start" ]; then
         run_as_commerce "$run_user" "$directory" "$pm2_binary" start ecosystem.config.cjs --only "$app_name"
+      elif [ "$operation" = "restart" ]; then
+        run_as_commerce "$run_user" "$directory" "$pm2_binary" startOrRestart ecosystem.config.cjs --only "$app_name" --update-env
       else
         run_as_commerce "$run_user" "$directory" "$pm2_binary" save
       fi
@@ -1525,6 +1529,9 @@ materialize_site() {
   require_request "$request_id" "$slug" "$run_user"
   checkout_directory="$WORKER_CHECKOUT_ROOT/$request_id"
   site_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
+  if [ "${4:-}" = update ]; then
+    site_directory="$site_directory.update"
+  fi
   [ ! -L "$WORKER_CHECKOUT_ROOT" ] && [ -d "$WORKER_CHECKOUT_ROOT" ] || fail "Worker checkout root is missing or a symlink."
   for checkout_parent in /var/lib/vidkar-provisioner /var/lib/vidkar-provisioner/state "$WORKER_CHECKOUT_ROOT"; do
     validate_worker_storage_directory "$checkout_parent"
@@ -1532,7 +1539,11 @@ materialize_site() {
   [ ! -L "$checkout_directory" ] && [ -d "$checkout_directory" ] || fail "Staging checkout is missing or a symlink."
   validate_worker_storage_directory "$checkout_directory"
   [ ! -L "$site_directory" ] && [ -d "$site_directory" ] || fail "Commerce site directory is missing or a symlink."
-  [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory has unexpected ownership."
+  if [ "${4:-}" = update ]; then
+    [ "$(stat -c '%u' "$site_directory")" -eq 0 ] || fail "Update staging must be root-owned before extraction."
+  else
+    [ "$(stat -c '%U' "$site_directory")" = "$run_user" ] || fail "Commerce site directory has unexpected ownership."
+  fi
   find "$site_directory" -mindepth 1 -maxdepth 1 -print -quit | grep -q . && fail "Commerce site directory is not empty."
 
   archive_file="$(mktemp "$HELPER_STATE_DIR/archive.XXXXXX.tar")"
@@ -1602,6 +1613,74 @@ PY
   rm -f "$archive_file"
   trap - EXIT HUP INT TERM
   rm -rf -- "$checkout_directory"
+}
+
+validate_update_directory() {
+  [ ! -L "$1" ] && [ -d "$1" ] || fail "Update directory is missing or a symlink."
+  [ "$(stat -c '%U' "$1")" = "$run_user" ] || fail "Update directory has unexpected ownership."
+}
+
+remove_update_directory() {
+  if [ -e "$1" ] || [ -L "$1" ]; then
+    [ ! -L "$1" ] && [ -d "$1" ] || fail "Update directory is not a real directory."
+    [ "$(stat -c '%U' "$1")" = "$run_user" ] || [ "$(stat -c '%u' "$1")" -eq 0 ] \
+      || fail "Update directory has unexpected ownership."
+    rm -rf -- "$1" || fail "Could not remove the isolated update directory."
+  fi
+}
+
+update_site() {
+  update_operation=$1
+  shift
+  slug=$1
+  request_id=$2
+  run_user=$3
+  valid_slug "$slug" || fail "Subdomain slug is invalid."
+  valid_request_id "$request_id" || fail "Request ID is invalid."
+  validate_deploy_root
+  validate_service_user "$slug" "$request_id" "$run_user"
+  require_request "$request_id" "$slug" "$run_user"
+  live_directory="$(site_directory_for "$slug" "$request_id" "$run_user")"
+  update_directory="$live_directory.update"
+  previous_directory="$live_directory.previous"
+  case "$update_operation" in
+    prepare)
+      validate_update_directory "$live_directory"
+      remove_update_directory "$update_directory"
+      remove_update_directory "$previous_directory"
+      mkdir -m 0700 "$update_directory"
+      materialize_site "$slug" "$request_id" "$run_user" update
+      [ -f "$live_directory/.env" ] && [ ! -L "$live_directory/.env" ] \
+        || fail "The active store environment is missing or a symlink."
+      cp_binary="$(trusted_binary cp)"
+      run_as_commerce "$run_user" "$live_directory" "$cp_binary" --no-dereference --preserve=mode -- .env "$update_directory/.env"
+      [ -f "$update_directory/.env" ] && [ ! -L "$update_directory/.env" ] \
+        || fail "Could not preserve the store environment."
+      npm_binary="$(trusted_binary npm)"
+      run_as_commerce "$run_user" "$update_directory" "$npm_binary" install -f --include=dev
+      ;;
+    activate)
+      validate_update_directory "$update_directory"
+      validate_update_directory "$live_directory"
+      [ ! -e "$previous_directory" ] && [ ! -L "$previous_directory" ] \
+        || fail "A previous update has not been reconciled."
+      mv -T -- "$live_directory" "$previous_directory"
+      mv -T -- "$update_directory" "$live_directory"
+      ;;
+    restore)
+      if [ -e "$previous_directory" ] || [ -L "$previous_directory" ]; then
+        validate_update_directory "$previous_directory"
+        if [ -e "$live_directory" ] || [ -L "$live_directory" ]; then
+          validate_update_directory "$live_directory"
+          remove_update_directory "$update_directory"
+          mv -T -- "$live_directory" "$update_directory"
+        fi
+        mv -T -- "$previous_directory" "$live_directory"
+      fi
+      validate_update_directory "$live_directory"
+      ;;
+    *) fail "Unsupported update operation." ;;
+  esac
 }
 
 run_certbot_issue() {
@@ -1737,11 +1816,16 @@ case "$command" in
     [ "$#" -eq 3 ] || fail "Usage: npm-install <slug> <request-id> <service-user>"
     run_npm_install "$@"
     ;;
-  pm2-start|pm2-save|pm2-delete)
+  prepare-update|activate-update|restore-update)
+    [ "$#" -eq 3 ] || fail "Usage: update <slug> <request-id> <service-user>"
+    update_site "${command%-update}" "$@"
+    ;;
+  pm2-start|pm2-save|pm2-delete|pm2-restart)
     [ "$#" -eq 3 ] || fail "Usage: pm2-start|pm2-save|pm2-delete <slug> <request-id> <service-user>"
     pm2_operation=start
     [ "$command" = "pm2-save" ] && pm2_operation=save
     [ "$command" = "pm2-delete" ] && pm2_operation=delete
+    [ "$command" = "pm2-restart" ] && pm2_operation=restart
     run_pm2_operation "$pm2_operation" "$@"
     ;;
   enable-pm2)

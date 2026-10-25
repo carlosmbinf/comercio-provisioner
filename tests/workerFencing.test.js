@@ -279,7 +279,7 @@ test("al detener PM2 el worker se desregistra, desconecta DDP y libera el lock l
     "comercio.provisioning.worker.unregister",
   ]);
   assert.deepEqual(methodCalls[0].slice(1), [
-    "worker-token", "worker-session-123", "192.0.2.44", true, "provisioner-install-1",
+    "worker-token", "worker-session-123", "192.0.2.44", true, "provisioner-install-1", true,
   ]);
   assert.ok(calls.indexOf("disconnect") < calls.indexOf("release-lock"));
 });
