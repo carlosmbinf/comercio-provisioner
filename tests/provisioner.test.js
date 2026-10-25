@@ -951,6 +951,58 @@ test("el helper instala dependencias de desarrollo necesarias para compilar Vite
   assert.match(helper, /run_as_commerce "\$run_user" "\$directory" "\$npm_binary" install -f --include=dev/);
 });
 
+test("el helper detiene el alta si otro vhost ya reclama el hostname", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  const installSite = helper.match(/^install_site\(\) \{\n[\s\S]*?^\}/m);
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-nginx-conflict-"));
+  assert.ok(installSite, "debe existir la función que instala el vhost");
+
+  try {
+    const available = path.join(root, "sites-available");
+    const enabled = path.join(root, "sites-enabled");
+    await fs.mkdir(available, { recursive: true });
+    await fs.mkdir(enabled, { recursive: true });
+
+    const script = [
+      "set -eu",
+      'fail() { printf "%s\\n" "$1" >&2; exit 1; }',
+      "valid_slug() { :; }",
+      "valid_port() { :; }",
+      "valid_request_id() { :; }",
+      "validate_service_user() { :; }",
+      "validate_paths() { :; }",
+      "validate_nginx_directories() { :; }",
+      "check_dns() { :; }",
+      "require_request() { :; }",
+      "register_request() { :; }",
+      'render_http() { printf "server_name %s;\\n" "$1"; }',
+      'render_https() { printf "server_name %s;\\n" "$1"; }',
+      'nginx() { printf "%s\\n" "$NGINX_TEST_OUTPUT" >&2; return 0; }',
+      'systemctl() { printf "NGINX_RELOADED\\n"; }',
+      installSite[0],
+      'install_site http tienda 5200 request-fixture "$AVAILABLE" "$ENABLED" "$ACME_WEBROOT" 192.0.2.10 vcomreq-fixture',
+    ].join("\n");
+    const result = spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        ACME_WEBROOT: path.join(root, "acme"),
+        AVAILABLE: available,
+        ENABLED: enabled,
+        NGINX_TEST_OUTPUT: 'nginx: [warn] conflicting server name "tienda.vidkar.com" on 0.0.0.0:80, ignored',
+      },
+    });
+
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /conflicting server name "tienda\.vidkar\.com"/);
+    assert.match(result.stderr, /Another NGINX server block already claims tienda\.vidkar\.com/);
+    assert.doesNotMatch(result.stdout, /NGINX_RELOADED/);
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
 test("el helper exige COMERCIO_HOST igual al dominio solicitado", async () => {
   const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
   const helper = await fs.readFile(helperPath, "utf8");

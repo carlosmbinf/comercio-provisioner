@@ -694,7 +694,14 @@ install_site() {
   if [ ! -L "$enabled_link" ]; then
     ln -s "$config_file" "$enabled_link"
   fi
-  nginx -t
+  nginx_test_output="$(nginx -t 2>&1)" || {
+    printf '%s\n' "$nginx_test_output" >&2
+    fail "NGINX configuration validation failed."
+  }
+  if printf '%s\n' "$nginx_test_output" | grep -F "conflicting server name \"$hostname\"" >/dev/null; then
+    printf '%s\n' "$nginx_test_output" >&2
+    fail "Another NGINX server block already claims $hostname; reconcile the existing configuration before provisioning."
+  fi
   systemctl reload nginx
 }
 

@@ -16,7 +16,7 @@ La documentación pública de Squarespace no ofrece una API de DNS. Sus Commerce
 
 ## Configuración
 
-La configuración del worker está centralizada en el `.env` local de este proyecto. No se debe versionar ni copiar a registros, mensajes de error o tareas. Este repositorio incluye un `.env` local con marcadores para completar fuera de Git; configura sus valores antes de arrancar.
+La configuración del worker está centralizada en el `.env` local de este proyecto. No se debe versionar ni copiar a registros, mensajes de error o tareas. En un checkout nuevo, crea `.env` a partir de [.env.example](./.env.example); el archivo `.env` no se distribuye ni se versiona.
 
 Variables necesarias:
 
@@ -34,7 +34,7 @@ Las descargas de VIDKAR se leen de `Meteor.settings.public.empresaAppLinks`; el 
 
 ## Requisitos del VPS
 
-- Node.js 20 o posterior, Git, PM2, Nginx, Certbot, Python 3 (stdlib) y `procps` (`ps`).
+- Debian o Ubuntu con `systemd`, Node.js 20 o posterior instalado para todo el sistema, `npm`, `sudo`, Git, PM2, Nginx, Certbot, Python 3 (stdlib) y `procps` (`ps`). El worker ejecuta `sudo -n` para cada operación privilegiada incluso cuando corre como `root`.
 - El VPS necesita salida TCP 443 hacia ACME de Let's Encrypt. El helper reintenta hasta tres veces los errores de conexión de Certbot, con cinco segundos entre intentos y dentro del timeout de emisión existente; no reintenta errores de validación HTTP-01. Si agota los intentos, informa el fallo de red explícitamente y conserva el rollback. Un `Network is unreachable` final puede corresponder al último intento IPv6 después de fallar IPv4: comprobar también IPv4 directa antes de atribuirlo solo a IPv6. Mantener Certbot actualizado; la versión 0.40.0 es antigua.
 - Si ACME devuelve un límite de emisión, el worker comunica la fecha `retry after` en UTC cuando está disponible. No reintenta automáticamente ese rechazo. Borrar un lineage local no libera el cupo de Let's Encrypt; esperar el plazo indicado o recuperar una copia válida del certificado existente para el dominio.
 - DNS A del subdominio resolviendo a `PROVISIONER_PUBLIC_IPV4` antes de que el trabajo salga de `PENDIENTE_DNS`.
@@ -46,16 +46,9 @@ Las descargas de VIDKAR se leen de `Meteor.settings.public.empresaAppLinks`; el 
 - Instala el código, `node_modules` y `ecosystem.config.cjs` en una ruta root-owned no modificable por usuarios sin privilegios (preferiblemente fuera de `/home/cloud`); el `.env` debe ser `root:root` con modo `0600`. El proceso root carga código, dependencias, token DDP y clave HMAC, por lo que no debe poder modificarlos otro usuario.
 - `/opt`, `/opt/vidkar`, `/opt/vidkar/comercios`, `/var/lib/vidkar-commerce` y las carpetas de Nginx administradas deben ser directorios reales root-owned y no escribibles por grupo/otros. El helper se niega a borrar si encuentra symlinks, ownership o permisos inesperados.
 
-En la preparación manual del VPS, instala el helper desde este repositorio como `root:root` con permisos `0755` y crea el grupo `vidkar-commerce`. El usuario legacy `vidkar-provisioner` puede conservarse para permitir la limpieza de staging antiguo; el worker actual no depende de él ni requiere una regla sudoers propia. El helper sigue validando firmas HMAC y ejecutando las operaciones de cada tienda bajo su cuenta aislada.
+Para instalar un VPS nuevo desde cero, sigue la [guía de configuración del VPS](./GUIA_VPS.md). Incluye el helper root-owned, la clave HMAC sincronizada con `.env`, el preflight y el primer arranque. No basta con crear un archivo de clave vacío: su contenido debe coincidir exactamente con `PROVISIONER_HELPER_HMAC_SECRET`.
 
-Ejemplo de preparación única (el helper y la clave deben permanecer root-owned):
-
-```sh
-sudo install -o root -g root -m 0755 scripts/vidkar-commerce-helper /usr/local/sbin/vidkar-commerce-helper
-sudo groupadd --system vidkar-commerce
-sudo install -d -o root -g root -m 0755 /etc/vidkar
-sudo install -o root -g root -m 0600 /dev/null /etc/vidkar/commerce-helper.key
-```
+El usuario legacy `vidkar-provisioner` puede conservarse para permitir la limpieza de staging antiguo; el worker actual no depende de él ni requiere una regla sudoers propia. El helper valida firmas HMAC y ejecuta las operaciones de cada tienda bajo su cuenta aislada.
 
 El helper crea una unidad systemd de PM2 por comercio; no se requiere configurar `pm2 startup` manualmente por tienda. Los nombres/binarios de Git/npm/PM2 deben estar en rutas root-owned ejecutables dentro de `/usr/bin` o `/usr/local/bin`.
 
