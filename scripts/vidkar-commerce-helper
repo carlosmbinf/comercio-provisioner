@@ -1548,7 +1548,7 @@ materialize_site() {
 
   archive_file="$(mktemp "$HELPER_STATE_DIR/archive.XXXXXX.tar")"
   trap 'rm -f "$archive_file"' EXIT HUP INT TERM
-  tar -C "$checkout_directory" --exclude=.git -cf "$archive_file" .
+  tar -C "$checkout_directory" --exclude=.git --exclude=.agents/skills -cf "$archive_file" .
   archive_members="$(tar -tf "$archive_file")"
   while IFS= read -r member; do
     [ -n "$member" ] || continue

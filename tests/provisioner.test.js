@@ -1374,6 +1374,34 @@ test("el helper acepta staging root-owned o del worker legacy, pero rechaza otro
   assert.match(helper, /validate_worker_storage_directory "\$checkout_directory"/);
 });
 
+test("el archivo de despliegue omite el enlace simbólico de skills y conserva los archivos de la app", async () => {
+  const helperPath = path.resolve(__dirname, "../scripts/vidkar-commerce-helper");
+  const helper = await fs.readFile(helperPath, "utf8");
+  assert.match(helper, /tar -C "\$checkout_directory" --exclude=\.git --exclude=\.agents\/skills -cf "\$archive_file" \./);
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-provisioner-archive-"));
+  const source = path.join(root, "source");
+  const archive = path.join(root, "source.tar");
+  try {
+    await fs.mkdir(path.join(source, ".agents"), { recursive: true });
+    await fs.mkdir(path.join(source, "src"), { recursive: true });
+    await fs.symlink("../../skills", path.join(source, ".agents", "skills"));
+    await fs.writeFile(path.join(source, "src", "index.js"), "export default true;\n");
+
+    const archived = spawnSync("tar", [
+      "-C", source, "--exclude=.git", "--exclude=.agents/skills", "-cf", archive, ".",
+    ], { encoding: "utf8" });
+    assert.equal(archived.status, 0, archived.stderr);
+
+    const listing = spawnSync("tar", ["-tf", archive], { encoding: "utf8" });
+    assert.equal(listing.status, 0, listing.stderr);
+    assert.match(listing.stdout, /\.\/src\/index\.js\n/);
+    assert.doesNotMatch(listing.stdout, /\.\/\.agents\/skills(?:\n|$)/);
+  } finally {
+    await fs.rm(root, { force: true, recursive: true });
+  }
+});
+
 test("el rollback reporta cada etapa terminada sin ejecutar operaciones privilegiadas inexistentes", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "vidkar-provisioner-rollback-"));
   const reports = [];
